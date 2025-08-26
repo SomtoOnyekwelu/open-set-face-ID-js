@@ -34,7 +34,7 @@
 
   <div id="log"></div>
 
-  <!-- MediaPipe Face Mesh - CORRECTED URLs -->
+  <!-- THE CRITICAL FIX: Corrected package name from @medipe to @mediapipe -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
 
@@ -67,7 +67,7 @@
     const tmpCanvas = document.createElement('canvas');
     const alignedTmpCanvas = document.createElement('canvas');
     let isProcessing = false;
-    let pendingFace = null; 
+    let pendingFace = null;
 
     class EmbeddingTracker{constructor(opts={}){this.matchThreshold=opts.matchThreshold??0.62;this.galleryThreshold=opts.galleryThreshold??0.58;this.iouThreshold=opts.iouThreshold??0.45;this.maxAgeFrames=opts.maxAgeFrames??150;this.embBufferSize=opts.embBufferSize??8;this.minEmbForNewTrack=opts.minEmbForNewTrack??true;this.nextId=1;this.tracks={};this.activeTrackIds=new Set();} _newId(){return`P${this.nextId++}`} static cosine(a,b){if(!a||!b||a.length!==b.length)return-1;let dot=0,na=0,nb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];} return dot/(Math.sqrt(na)*Math.sqrt(nb)+1e-10)} static iou(b1,b2){const x1=Math.max(b1.x,b2.x),y1=Math.max(b1.y,b2.y),x2=Math.min(b1.x+b1.w,b2.x+b2.w),y2=Math.min(b1.y+b1.h,b2.y+b2.h);const iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1);const inter=iw*ih,union=b1.w*b1.h+b2.w*b2.h-inter;return union<=0?0:inter/union} _computeMean(track){if(!track.embBuffer||track.embBuffer.length===0)return null;const K=track.embBuffer.length,D=track.embBuffer[0].length;const mean=new Float32Array(D);for(let i=0;i<K;i++){const e=track.embBuffer[i];for(let d=0;d<D;d++)mean[d]+=e[d];} for(let d=0;d<D;d++)mean[d]/=K;let norm=0;for(let d=0;d<D;d++)norm+=mean[d]*mean[d];norm=Math.sqrt(norm)+1e-10;for(let d=0;d<D;d++)mean[d]/=norm;track.embMean=mean;return mean} _pushEmb(track,emb){if(!emb)return;const e=(emb instanceof Float32Array)?emb.slice(0):new Float32Array(emb);if(!track.embBuffer)track.embBuffer=[];track.embBuffer.push(e);if(track.embBuffer.length>this.embBufferSize)track.embBuffer.shift();this._computeMean(track)} _createTrack(det,frameIdx){const id=this._newId();const track={id,embBuffer:[],embMean:null,lastSeenFrame:frameIdx,bbox:det.bbox,active:true,createdAt:Date.now()};if(det.emb)this._pushEmb(track,det.emb);this.tracks[id]=track;this.activeTrackIds.add(id);return track} _updateTrack(track,det,frameIdx){track.lastSeenFrame=frameIdx;track.bbox=det.bbox;if(det.emb)this._pushEmb(track,det.emb);track.active=true;this.activeTrackIds.add(track.id);return track} prune(frameIdx){for(const id in this.tracks){const t=this.tracks[id];if(frameIdx-t.lastSeenFrame>this.maxAgeFrames){t.active=false;this.activeTrackIds.delete(id);}}} getActiveTracks(){return Array.from(this.activeTrackIds).map(id=>this.tracks[id])} updateOne(det,frameIdx=0){if(det.emb){let best={id:null,score:-2};for(const id of this.activeTrackIds){const t=this.tracks[id];if(!t.embMean)continue;const s=EmbeddingTracker.cosine(det.emb,t.embMean);if(s>best.score)best={id,score:s};} if(best.id&&best.score>=this.matchThreshold){const t=this.tracks[best.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:best.score,matchedBy:'emb'};} let bestGal={id:null,score:-2};for(const id in this.tracks){const t=this.tracks[id];if(!t.embMean)continue;const s=EmbeddingTracker.cosine(det.emb,t.embMean);if(s>bestGal.score)bestGal={id,score:s};} if(bestGal.id&&bestGal.score>=this.galleryThreshold){const t=this.tracks[bestGal.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:bestGal.score,matchedBy:'gallery'};}} let bestIou={id:null,score:0};for(const id of this.activeTrackIds){const t=this.tracks[id];const s=EmbeddingTracker.iou(t.bbox,det.bbox);if(s>bestIou.score)bestIou={id,score:s};} if(bestIou.id&&bestIou.score>=this.iouThreshold){const t=this.tracks[bestIou.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:bestIou.score,matchedBy:'iou'};} if(det.emb||!this.minEmbForNewTrack){const newTrack=this._createTrack(det,frameIdx);return{id:newTrack.id,score:null,matchedBy:'new'};} return{id:null,score:null,matchedBy:'none'}} updateBatch(detections,frameIdx=0){const assignments=[];const idxs=detections.map((_,i)=>i).sort((a,b)=>(detections[b].emb?1:0)-(detections[a].emb?1:0));for(const i of idxs){const det=detections[i];assignments[i]=this.updateOne(det,frameIdx);} this.prune(frameIdx);return assignments} saveGallery(key='face_gallery_v1'){const dump=[];for(const id in this.tracks){const t=this.tracks[id];if(t.embMean)dump.push({id:t.id,emb:Array.from(t.embMean),lastSeen:t.lastSeenFrame,createdAt:t.createdAt});} localStorage.setItem(key,JSON.stringify(dump))} loadGallery(key='face_gallery_v1'){const raw=localStorage.getItem(key);if(!raw)return;try{const dump=JSON.parse(raw);for(const e of dump){const t={id:e.id,embBuffer:[new Float32Array(e.emb)],embMean:new Float32Array(e.emb),lastSeenFrame:e.lastSeen??0,bbox:{x:0,y:0,w:0,h:0},active:false,createdAt:e.createdAt??Date.now()};this.tracks[t.id]=t;} const maxId=Object.keys(this.tracks).reduce((m,id)=>Math.max(m,parseInt(id.replace('P',''))),0);if(maxId>=this.nextId)this.nextId=maxId+1;}catch(e){console.warn('loadGallery failed',e)}}}
     function umeyama(srcPts,dstPts){const N=srcPts.length;if(N<2)return;const muX=[0,0],muY=[0,0];for(let i=0;i<N;i++){muX[0]+=srcPts[i][0];muX[1]+=srcPts[i][1];muY[0]+=dstPts[i][0];muY[1]+=dstPts[i][1];}muX[0]/=N;muX[1]/=N;muY[0]/=N;muY[1]/=N;const Xc=srcPts.map(p=>[p[0]-muX[0],p[1]-muX[1]]);const Yc=dstPts.map(p=>[p[0]-muY[0],p[1]-muY[1]]);let cov=[[0,0],[0,0]];for(let i=0;i<N;i++){cov[0][0]+=Yc[i][0]*Xc[i][0];cov[0][1]+=Yc[i][0]*Xc[i][1];cov[1][0]+=Yc[i][1]*Xc[i][0];cov[1][1]+=Yc[i][1]*Xc[i][1];}for(let i=0;i<2;i++)for(let j=0;j<2;j++)cov[i][j]/=N;const ATA=[[cov[0][0]*cov[0][0]+cov[1][0]*cov[1][0],cov[0][0]*cov[0][1]+cov[1][0]*cov[1][1]],[cov[0][1]*cov[0][0]+cov[1][1]*cov[1][0],cov[0][1]*cov[0][1]+cov[1][1]*cov[1][1]]];const tr=ATA[0][0]+ATA[1][1],det=ATA[0][0]*ATA[1][1]-ATA[0][1]*ATA[1][0];const tmp=Math.sqrt(Math.max(0,tr*tr/4-det));const s1=Math.sqrt(Math.max(0,tr/2+tmp));const s2=Math.sqrt(Math.max(0,tr/2-tmp));function eigv(A,lam){const a=A[0][0]-lam,b=A[0][1];return Math.abs(a)+Math.abs(b)<1e-8?[1,0]:[-b,a];}const v1=eigv(ATA,tr/2+tmp);const v1n=Math.hypot(v1[0],v1[1])||1;const V=[[v1[0]/v1n,-v1[1]/v1n],[v1[1]/v1n,v1[0]/v1n]];let U=[[1,0],[0,1]];if(s1>1e-8){const c0=[cov[0][0]*V[0][0]+cov[0][1]*V[1][0],cov[1][0]*V[0][0]+cov[1][1]*V[1][0]];const n0=Math.hypot(c0[0],c0[1])||1;U[0][0]=c0[0]/n0;U[1][0]=c0[1]/n0;U[0][1]=-U[1][0];U[1][1]=U[0][0];}const dU=U[0][0]*U[1][1]-U[0][1]*U[1][0],dV=V[0][0]*V[1][1]-V[0][1]*V[1][0];const S=[1,1];if(dU*dV<0)S[1]=-1;const Vt=[[V[0][0],V[1][0]],[V[0][1],V[1][1]]];const US=[[U[0][0]*S[0],U[0][1]*S[1]],[U[1][0]*S[0],U[1][1]*S[1]]];const R=[[US[0][0]*Vt[0][0]+US[0][1]*Vt[1][0],US[0][0]*Vt[0][1]+US[0][1]*Vt[1][1]],[US[1][0]*Vt[0][0]+US[1][1]*Vt[1][0],US[1][0]*Vt[0][1]+US[1][1]*Vt[1][1]]];let v=0;for(let i=0;i<N;i++)v+=Xc[i][0]*Xc[i][0]+Xc[i][1]*Xc[i][1];v/=N;const sc=v<1e-12?1:((s1*S[0]+s2*S[1])/v);const RmuX=[R[0][0]*muX[0]+R[0][1]*muX[1],R[1][0]*muX[0]+R[1][1]*muX[1]];const t=[muY[0]-sc*RmuX[0],muY[1]-sc*RmuX[1]];return[[sc*R[0][0],sc*R[0][1],t[0]],[sc*R[1][0],sc*R[1][1],t[1]],[0,0,1]];}
@@ -80,10 +80,9 @@
         pendingFace.emb = data.embedding;
         tracker.updateOne(pendingFace, frameCounter);
         pendingFace = null; 
-        isProcessing = false; 
       }
     };
-    socket.onerror = (error) => { log('WebSocket Error:', JSON.stringify(error, Object.getOwnPropertyNames(error))); status.textContent = 'Connection Error'; };
+    socket.onerror = (error) => { log('WebSocket Error. Check console for details.'); status.textContent = 'Connection Error'; console.error(error); };
     socket.onclose = () => { log('Disconnected from backend.'); status.textContent = 'Disconnected'; };
     
     async function onResults(results) {
@@ -102,11 +101,11 @@
       
       tracker.updateBatch(allDetections, frameCounter);
       
-      if (!isProcessing && pendingFace === null && allDetections.length > 0) {
+      if (!isProcessing && allDetections.length > 0) {
         allDetections.sort((a,b) => (b.bbox.w*b.bbox.h) - (a.bbox.w*a.bbox.h));
         const faceToProcess = allDetections[0];
 
-        isProcessing = true; 
+        isProcessing = true; // Set lock
         pendingFace = faceToProcess;
 
         const key5 = [faceToProcess.landmarks[33], faceToProcess.landmarks[263], faceToProcess.landmarks[1], faceToProcess.landmarks[61], faceToProcess.landmarks[291]];
@@ -120,7 +119,9 @@
         actx.drawImage(tmpCanvas,0,0,faceToProcess.bbox.w,faceToProcess.bbox.h); actx.restore();
         
         const dataUrl = alignedTmpCanvas.toDataURL('image/jpeg', 0.9);
-        socket.send(dataUrl);
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send(dataUrl);
+        }
 
         alignedThumbCtx.clearRect(0,0,EMBED_W,EMBED_H);
         alignedThumbCtx.drawImage(alignedTmpCanvas,0,0,EMBED_W,EMBED_H);
@@ -134,6 +135,10 @@
           ctx.fillStyle = 'yellow'; ctx.font = '16px Arial';
           ctx.fillText(label, track.bbox.x, Math.max(16, track.bbox.y - 6));
       }
+       // Finally, release lock if no face was sent for processing
+      if (!pendingFace) {
+        isProcessing = false;
+      }
     }
 
     tracker = new EmbeddingTracker(TRACKER_PARAMS);
@@ -145,7 +150,11 @@
     faceMesh.onResults(onResults);
 
     const camera = new Camera(video, {
-      onFrame: async () => { await faceMesh.send({ image: video }); },
+      onFrame: async () => {
+        if (!isProcessing) { // Use lock here to prevent flooding MediaPipe
+            await faceMesh.send({ image: video });
+        }
+      },
       width: VIDEO_W,
       height: VIDEO_H
     });
