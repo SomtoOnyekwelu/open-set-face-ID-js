@@ -90,6 +90,10 @@
     let faceMesh = null;
     let camera = null;
     const idToName = {}; // user-provided labels for track IDs (persistable)
+    
+    // ADD THESE TWO LINES:
+    const tmpCanvas = document.createElement('canvas');
+    const alignedTmpCanvas = document.createElement('canvas');
 
     // ---------- small utility functions ----------
     function drawPoints(ctx, pts, color='lime', size=2){
@@ -368,23 +372,30 @@
         frameCounter++;
         ctx.clearRect(0,0, overlay.width, overlay.height);
         ctx.drawImage(results.image, 0, 0, overlay.width, overlay.height);
-
+    
         if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0){
           return;
         }
         const facesLM = results.multiFaceLandmarks;
         // Build detection objects
         const detections = [];
+        
+        // --- Get contexts once, before the loop ---
+        const tctx = tmpCanvas.getContext('2d');
+        const actx = alignedTmpCanvas.getContext('2d');
+        alignedTmpCanvas.width = EMBED_W;
+        alignedTmpCanvas.height = EMBED_H;
+    
         for(let f=0; f<facesLM.length; f++){
           const landmarks = facesLM[f];
           // convert normalized to pixels
           const pts = landmarks.map(l => [l.x * VIDEO_W, l.y * VIDEO_H]);
-
+    
           // draw 5 key points for debug
           const idxs = { leftEye:33, rightEye:263, nose:1, leftMouth:61, rightMouth:291 };
           const key5 = [ pts[idxs.leftEye], pts[idxs.rightEye], pts[idxs.nose], pts[idxs.leftMouth], pts[idxs.rightMouth] ];
           drawPoints(ctx, key5, 'red', 2);
-
+    
           // bbox from all landmarks (robust)
           let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
           for(const p of pts){ if(p[0]<minx) minx=p[0]; if(p[1]<miny) miny=p[1]; if(p[0]>maxx) maxx=p[0]; if(p[1]>maxy) maxy=p[1]; }
@@ -398,55 +409,54 @@
           if(x0 + w > VIDEO_W) w = VIDEO_W - x0;
           if(y0 + h > VIDEO_H) h = VIDEO_H - y0;
           if(w <= 0 || h <= 0) continue;
-
+    
           // draw bbox
           ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(x0, y0, w, h);
-
-          // prepare temporary canvas crop
-          const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
-          const tctx = tmp.getContext('2d');
+    
+          // --- REUSE CANVAS INSTEAD OF CREATING ---
+          // prepare temporary canvas crop by resizing and drawing
+          tmpCanvas.width = w; tmpCanvas.height = h;
           tctx.drawImage(video, x0, y0, w, h, 0, 0, w, h);
-
+    
           // compute src5 in resized crop coords
           const scaleX = EMBED_W / w, scaleY = EMBED_H / h;
           const src5_resized = key5.map(p => [(p[0]-x0)*scaleX, (p[1]-y0)*scaleY]);
-
-          // compute transform and draw aligned onto temporary aligned canvas
+          
+          // compute transform and draw aligned onto the reusable aligned canvas
           const M = umeyama(src5_resized, CANONICAL_5);
-          const alignedTmp = document.createElement('canvas'); alignedTmp.width = EMBED_W; alignedTmp.height = EMBED_H;
-          const actx = alignedTmp.getContext('2d');
+          actx.clearRect(0, 0, EMBED_W, EMBED_H); // Clear before use
           actx.save();
           const a = M[0][0], b = M[0][1], tx = M[0][2], c = M[1][0], d = M[1][1], ty = M[1][2];
           actx.setTransform(a, c, b, d, tx, ty);
-          actx.drawImage(tmp, 0, 0, w, h);
+          actx.drawImage(tmpCanvas, 0, 0, w, h);
           actx.restore();
-
+          
           // show thumbnail of last processed face (for debug)
           alignedThumbCtx.clearRect(0,0, EMBED_W, EMBED_H);
-          alignedThumbCtx.drawImage(alignedTmp, 0, 0, EMBED_W, EMBED_H);
-
+          alignedThumbCtx.drawImage(alignedTmpCanvas, 0, 0, EMBED_W, EMBED_H);
+    
           // build detection record
           detections.push({
             bbox: { x: x0, y: y0, w: w, h: h },
-            alignedCanvas: alignedTmp, // we will read ImageData later if processing embeddings
-            emb: null  // filled below if we run embedding extraction
+            alignedCanvas: alignedTmpCanvas, // we pass the reference to the same canvas
+            emb: null
           });
         } // end per-face build
-
-        // decide whether we compute embeddings this frame
+    
         const processEvery = Math.max(1, parseInt(procEveryInput.value || '2', 10));
         const doEmb = (frameCounter % processEvery) === 0;
-
-        // if there are detections, compute embeddings (sequentially to avoid overloading)
+    
         if(detections.length > 0 && doEmb){
           for(let i=0;i<detections.length;i++){
             try {
+              // NOTE: We are now getting ImageData from the same canvas over and over,
+              // but that's okay because we re-drew the correct face onto it for each detection.
               const idata = detections[i].alignedCanvas.getContext('2d').getImageData(0,0, EMBED_W, EMBED_H);
               const tensor = imageDataToTensor(idata);
               const feeds = {}; feeds[inputName] = tensor;
               const out = await session.run(feeds);
               const embArr = out[outputName].data;
-              // normalize
+              
               const f = new Float32Array(embArr.length);
               let norm=0; for(let k=0;k<embArr.length;k++){ norm += embArr[k]*embArr[k]; f[k]=embArr[k]; }
               norm = Math.sqrt(norm)+1e-10;
@@ -458,25 +468,20 @@
             }
           }
         }
-
-        // feed detections to tracker in batch
+    
         const assignments = tracker.updateBatch(detections, frameCounter);
-
-        // draw per-detection labels
+    
         for(let i=0;i<detections.length;i++){
           const a = assignments[i];
           const det = detections[i];
           let label = 'unknown';
           if(a && a.id){
-            // map to human label if user assigned
             const human = idToName[a.id] || a.id;
             if(a.score !== null && a.score !== undefined) label = `${human} ${a.score.toFixed(2)}`;
             else label = human;
           }
-          // draw label above bbox
           ctx.fillStyle = 'yellow'; ctx.font = '16px Arial';
           ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y - 6));
-          // also draw ID small inside box corner
           if(a && a.id){
             ctx.fillStyle = 'rgba(0,0,0,0.5)';
             ctx.fillRect(det.bbox.x + det.bbox.w - 70, det.bbox.y + det.bbox.h - 20, 70, 20);
@@ -484,11 +489,11 @@
             ctx.fillText(a.id, det.bbox.x + det.bbox.w - 64, det.bbox.y + det.bbox.h - 6);
           }
         }
-
+    
       } catch (err) {
         console.error('onResults error:', err);
       }
-    } // end onResults
+    } // end onResults // end onResults
 
     // ---------- register onResults and start camera ----------
     faceMesh.onResults(onResults);
