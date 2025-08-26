@@ -49,30 +49,21 @@
     // -------- CONFIG
     const VIDEO_W = 640, VIDEO_H = 480;
     const EMBED_W = 112, EMBED_H = 112;
-    const MODEL_PATH = './model.onnx'; // place your ONNX here
-    const CANONICAL_5 = [   // canonical 5-point (ArcFace style, 112x112)
-      [30.2946, 51.6963],
-      [65.5318, 51.5014],
-      [48.0252, 71.7366],
-      [33.5493, 92.3655],
-      [62.7299, 92.2041]
+    const MODEL_PATH = './model.onnx';
+    const CANONICAL_5 = [
+      [30.2946, 51.6963], [65.5318, 51.5014], [48.0252, 71.7366],
+      [33.5493, 92.3655], [62.7299, 92.2041]
     ];
-    // Tracker & runtime tuning (tweak if necessary)
     const TRACKER_PARAMS = {
-      matchThreshold: 0.62,
-      galleryThreshold: 0.58,
-      iouThreshold: 0.45,
-      maxAgeFrames: 300,
-      embBufferSize: 6,
-      minEmbForNewTrack: true
+      matchThreshold: 0.62, galleryThreshold: 0.58, iouThreshold: 0.45,
+      maxAgeFrames: 300, embBufferSize: 6, minEmbForNewTrack: true
     };
-    const PAD_FACTOR = 1.4; // Corrected padding factor
+    const PAD_FACTOR = 1.4;
     // -------- end CONFIG
 
     const logEl = document.getElementById('log');
     function log(...s){ logEl.textContent += s.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
 
-    // DOM
     const video = document.getElementById('video');
     const overlay = document.getElementById('overlay');
     overlay.width = VIDEO_W; overlay.height = VIDEO_H;
@@ -83,220 +74,105 @@
     const status = document.getElementById('status');
     const procEveryInput = document.getElementById('procEvery');
 
-    // State variables
-    let session = null;
-    let tracker = null;
-    let frameCounter = 0;
-    let faceMesh = null;
-    let camera = null;
+    let session = null, tracker = null, frameCounter = 0, faceMesh = null;
     const idToName = {};
-
-    // Reusable canvases to prevent memory leaks
     const tmpCanvas = document.createElement('canvas');
     const alignedTmpCanvas = document.createElement('canvas');
 
-    // Processing lock to prevent frame backlog
+    // This lock is the key to the entire application's performance.
     let isProcessing = false;
 
-    // ---------- small utility functions ----------
-    function drawPoints(ctx, pts, color='lime', size=2){
-      ctx.fillStyle = color;
-      for(const p of pts){ ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI*2); ctx.fill(); }
-    }
+    // Condensed utility functions
+    function drawPoints(ctx, pts, color='lime', size=2){ ctx.fillStyle = color; for(const p of pts){ ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI*2); ctx.fill(); } }
+    function imageDataToTensor(imgData){ const {data,width,height}=imgData; const chw=new Float32Array(3*width*height); const plane=width*height; for(let y=0;y<height;y++){ for(let x=0;x<width;x++){ const i=(y*width+x)*4; const r=data[i],g=data[i+1],b=data[i+2]; const pix=y*width+x; chw[pix]=r/127.5-1.0; chw[plane+pix]=g/127.5-1.0; chw[2*plane+pix]=b/127.5-1.0; } } return new ort.Tensor('float32',chw,[1,3,height,width]); }
+    function umeyama(srcPts,dstPts){ const N=srcPts.length; if(N<2)throw 'Need >=2 points'; const muX=[0,0],muY=[0,0]; for(let i=0;i<N;i++){muX[0]+=srcPts[i][0];muX[1]+=srcPts[i][1];muY[0]+=dstPts[i][0];muY[1]+=dstPts[i][1];} muX[0]/=N;muX[1]/=N;muY[0]/=N;muY[1]/=N; const Xc=srcPts.map(p=>[p[0]-muX[0],p[1]-muX[1]]); const Yc=dstPts.map(p=>[p[0]-muY[0],p[1]-muY[1]]); let cov=[[0,0],[0,0]]; for(let i=0;i<N;i++){cov[0][0]+=Yc[i][0]*Xc[i][0];cov[0][1]+=Yc[i][0]*Xc[i][1];cov[1][0]+=Yc[i][1]*Xc[i][0];cov[1][1]+=Yc[i][1]*Xc[i][1];} for(let i=0;i<2;i++)for(let j=0;j<2;j++)cov[i][j]/=N; const ATA=[[cov[0][0]*cov[0][0]+cov[1][0]*cov[1][0],cov[0][0]*cov[0][1]+cov[1][0]*cov[1][1]],[cov[0][1]*cov[0][0]+cov[1][1]*cov[1][0],cov[0][1]*cov[0][1]+cov[1][1]*cov[1][1]]]; const trace=ATA[0][0]+ATA[1][1],det=ATA[0][0]*ATA[1][1]-ATA[0][1]*ATA[1][0]; const tmp=Math.sqrt(Math.max(0,trace*trace/4-det)); const s1=Math.sqrt(Math.max(0,trace/2+tmp)),s2=Math.sqrt(Math.max(0,trace/2-tmp)); function eigv(A,lam){const a=A[0][0]-lam,b=A[0][1];return Math.abs(a)+Math.abs(b)<1e-8?[1,0]:[-b,a];} const v1=eigv(ATA,trace/2+tmp);const v1n=Math.hypot(v1[0],v1[1])||1; const V=[[v1[0]/v1n,-v1[1]/v1n],[v1[1]/v1n,v1[0]/v1n]]; let U=[[1,0],[0,1]]; if(s1>1e-8){const col0=[cov[0][0]*V[0][0]+cov[0][1]*V[1][0],cov[1][0]*V[0][0]+cov[1][1]*V[1][0]];const n0=Math.hypot(col0[0],col[1])||1;U[0][0]=col0[0]/n0;U[1][0]=col0[1]/n0;U[0][1]=-U[1][0];U[1][1]=U[0][0];} const detU=U[0][0]*U[1][1]-U[0][1]*U[1][0],detV=V[0][0]*V[1][1]-V[0][1]*V[1][0]; const Sdiag=[1,1];if(detU*detV<0)Sdiag[1]=-1; const Vt=[[V[0][0],V[1][0]],[V[0][1],V[1][1]]]; const US=[[U[0][0]*Sdiag[0],U[0][1]*Sdiag[1]],[U[1][0]*Sdiag[0],U[1][1]*Sdiag[1]]]; const R=[[US[0][0]*Vt[0][0]+US[0][1]*Vt[1][0],US[0][0]*Vt[0][1]+US[0][1]*Vt[1][1]],[US[1][0]*Vt[0][0]+US[1][1]*Vt[1][0],US[1][0]*Vt[0][1]+US[1][1]*Vt[1][1]]]; let var_src=0;for(let i=0;i<N;i++)var_src+=Xc[i][0]*Xc[i][0]+Xc[i][1]*Xc[i][1];var_src/=N; const scale=var_src<1e-12?1.0:((s1*Sdiag[0]+s2*Sdiag[1])/var_src); const RmuX=[R[0][0]*muX[0]+R[0][1]*muX[1],R[1][0]*muX[0]+R[1][1]*muX[1]]; const t=[muY[0]-scale*RmuX[0],muY[1]-scale*RmuX[1]]; return[[scale*R[0][0],scale*R[0][1],t[0]],[scale*R[1][0],scale*R[1][1],t[1]],[0,0,1]];}
+    class EmbeddingTracker{constructor(opts={}){this.matchThreshold=opts.matchThreshold??0.62;this.galleryThreshold=opts.galleryThreshold??0.58;this.iouThreshold=opts.iouThreshold??0.45;this.maxAgeFrames=opts.maxAgeFrames??150;this.embBufferSize=opts.embBufferSize??8;this.minEmbForNewTrack=opts.minEmbForNewTrack??true;this.nextId=1;this.tracks={};this.activeTrackIds=new Set();} _newId(){return`P${this.nextId++}`} static cosine(a,b){if(!a||!b||a.length!==b.length)return-1;let dot=0,na=0,nb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];} return dot/(Math.sqrt(na)*Math.sqrt(nb)+1e-10)} static iou(b1,b2){const x1=Math.max(b1.x,b2.x),y1=Math.max(b1.y,b2.y),x2=Math.min(b1.x+b1.w,b2.x+b2.w),y2=Math.min(b1.y+b1.h,b2.y+b2.h);const iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1);const inter=iw*ih,union=b1.w*b1.h+b2.w*b2.h-inter;return union<=0?0:inter/union} _computeMean(track){if(!track.embBuffer||track.embBuffer.length===0)return null;const K=track.embBuffer.length,D=track.embBuffer[0].length;const mean=new Float32Array(D);for(let i=0;i<K;i++){const e=track.embBuffer[i];for(let d=0;d<D;d++)mean[d]+=e[d];} for(let d=0;d<D;d++)mean[d]/=K;let norm=0;for(let d=0;d<D;d++)norm+=mean[d]*mean[d];norm=Math.sqrt(norm)+1e-10;for(let d=0;d<D;d++)mean[d]/=norm;track.embMean=mean;return mean} _pushEmb(track,emb){if(!emb)return;const e=(emb instanceof Float32Array)?emb.slice(0):new Float32Array(emb);if(!track.embBuffer)track.embBuffer=[];track.embBuffer.push(e);if(track.embBuffer.length>this.embBufferSize)track.embBuffer.shift();this._computeMean(track)} _createTrack(det,frameIdx){const id=this._newId();const track={id,embBuffer:[],embMean:null,lastSeenFrame:frameIdx,bbox:det.bbox,active:true,createdAt:Date.now()};if(det.emb)this._pushEmb(track,det.emb);this.tracks[id]=track;this.activeTrackIds.add(id);return track} _updateTrack(track,det,frameIdx){track.lastSeenFrame=frameIdx;track.bbox=det.bbox;if(det.emb)this._pushEmb(track,det.emb);track.active=true;this.activeTrackIds.add(track.id);return track} prune(frameIdx){for(const id in this.tracks){const t=this.tracks[id];if(frameIdx-t.lastSeenFrame>this.maxAgeFrames){t.active=false;this.activeTrackIds.delete(id);}}} getActiveTracks(){return Array.from(this.activeTrackIds).map(id=>this.tracks[id])} updateOne(det,frameIdx=0){if(det.emb){let best={id:null,score:-2};for(const id of this.activeTrackIds){const t=this.tracks[id];if(!t.embMean)continue;const s=EmbeddingTracker.cosine(det.emb,t.embMean);if(s>best.score)best={id,score:s};} if(best.id&&best.score>=this.matchThreshold){const t=this.tracks[best.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:best.score,matchedBy:'emb'};} let bestGal={id:null,score:-2};for(const id in this.tracks){const t=this.tracks[id];if(!t.embMean)continue;const s=EmbeddingTracker.cosine(det.emb,t.embMean);if(s>bestGal.score)bestGal={id,score:s};} if(bestGal.id&&bestGal.score>=this.galleryThreshold){const t=this.tracks[bestGal.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:bestGal.score,matchedBy:'gallery'};}} let bestIou={id:null,score:0};for(const id of this.activeTrackIds){const t=this.tracks[id];const s=EmbeddingTracker.iou(t.bbox,det.bbox);if(s>bestIou.score)bestIou={id,score:s};} if(bestIou.id&&bestIou.score>=this.iouThreshold){const t=this.tracks[bestIou.id];this._updateTrack(t,det,frameIdx);return{id:t.id,score:bestIou.score,matchedBy:'iou'};} if(det.emb||!this.minEmbForNewTrack){const newTrack=this._createTrack(det,frameIdx);return{id:newTrack.id,score:null,matchedBy:'new'};} return{id:null,score:null,matchedBy:'none'}} updateBatch(detections,frameIdx=0){const assignments=[];const idxs=detections.map((_,i)=>i).sort((a,b)=>(detections[b].emb?1:0)-(detections[a].emb?1:0));for(const i of idxs){const det=detections[i];assignments[i]=this.updateOne(det,frameIdx);} this.prune(frameIdx);return assignments} saveGallery(key='face_gallery_v1'){const dump=[];for(const id in this.tracks){const t=this.tracks[id];if(t.embMean)dump.push({id:t.id,emb:Array.from(t.embMean),lastSeen:t.lastSeenFrame,createdAt:t.createdAt});} localStorage.setItem(key,JSON.stringify(dump))} loadGallery(key='face_gallery_v1'){const raw=localStorage.getItem(key);if(!raw)return;try{const dump=JSON.parse(raw);for(const e of dump){const t={id:e.id,embBuffer:[new Float32Array(e.emb)],embMean:new Float32Array(e.emb),lastSeenFrame:e.lastSeen??0,bbox:{x:0,y:0,w:0,h:0},active:false,createdAt:e.createdAt??Date.now()};this.tracks[t.id]=t;} const maxId=Object.keys(this.tracks).reduce((m,id)=>Math.max(m,parseInt(id.replace('P',''))),0);if(maxId>=this.nextId)this.nextId=maxId+1;}catch(e){console.warn('loadGallery failed',e)}}}
 
-    function imageDataToTensor(imgData){
-      const {data, width, height} = imgData;
-      const chw = new Float32Array(3*width*height);
-      const plane = width*height;
-      for(let y=0;y<height;y++){
-        for(let x=0;x<width;x++){
-          const i = (y*width + x)*4;
-          const r = data[i], g = data[i+1], b = data[i+2];
-          const pix = y*width + x;
-          chw[pix] = r/127.5 - 1.0;
-          chw[plane + pix] = g/127.5 - 1.0;
-          chw[2*plane + pix] = b/127.5 - 1.0;
-        }
-      }
-      return new ort.Tensor('float32', chw, [1,3,height,width]);
-    }
-
-    // ---------- Umeyama (similarity transform) ----------
-    function umeyama(srcPts, dstPts){
-      const N = srcPts.length;
-      if(N < 2) throw 'Need >=2 points for umeyama';
-      const muX = [0,0], muY = [0,0];
-      for(let i=0;i<N;i++){ muX[0]+=srcPts[i][0]; muX[1]+=srcPts[i][1]; muY[0]+=dstPts[i][0]; muY[1]+=dstPts[i][1]; }
-      muX[0]/=N; muX[1]/=N; muY[0]/=N; muY[1]/=N;
-      const Xc = srcPts.map(p => [p[0]-muX[0], p[1]-muX[1]]);
-      const Yc = dstPts.map(p => [p[0]-muY[0], p[1]-muY[1]]);
-      let cov = [[0,0],[0,0]];
-      for(let i=0;i<N;i++){
-        cov[0][0] += Yc[i][0]*Xc[i][0]; cov[0][1] += Yc[i][0]*Xc[i][1];
-        cov[1][0] += Yc[i][1]*Xc[i][0]; cov[1][1] += Yc[i][1]*Xc[i][1];
-      }
-      for(let i=0;i<2;i++) for(let j=0;j<2;j++) cov[i][j]/=N;
-      const ATA = [[cov[0][0]*cov[0][0] + cov[1][0]*cov[1][0], cov[0][0]*cov[0][1] + cov[1][0]*cov[1][1]],[cov[0][1]*cov[0][0] + cov[1][1]*cov[1][0], cov[0][1]*cov[0][1] + cov[1][1]*cov[1][1]]];
-      const trace = ATA[0][0] + ATA[1][1], det = ATA[0][0]*ATA[1][1] - ATA[0][1]*ATA[1][0];
-      const tmp = Math.sqrt(Math.max(0, trace*trace/4 - det));
-      const lambda1 = trace/2 + tmp, lambda2 = trace/2 - tmp;
-      const s1 = Math.sqrt(Math.max(0, lambda1)), s2 = Math.sqrt(Math.max(0, lambda2));
-      function eigv(A, lam){ const a=A[0][0]-lam, b=A[0][1]; return Math.abs(a)+Math.abs(b) < 1e-8 ? [1,0] : [-b, a]; }
-      const v1 = eigv(ATA, lambda1); const v1n = Math.hypot(v1[0], v1[1]) || 1;
-      const V = [[v1[0]/v1n, -v1[1]/v1n],[v1[1]/v1n, v1[0]/v1n]];
-      let U = [[1,0],[0,1]];
-      if(s1 > 1e-8){
-        const col0 = [cov[0][0]*V[0][0] + cov[0][1]*V[1][0], cov[1][0]*V[0][0] + cov[1][1]*V[1][0]];
-        const n0 = Math.hypot(col0[0], col0[1]) || 1;
-        U[0][0] = col0[0]/n0; U[1][0] = col0[1]/n0; U[0][1] = -U[1][0]; U[1][1] = U[0][0];
-      }
-      const detU = U[0][0]*U[1][1] - U[0][1]*U[1][0], detV = V[0][0]*V[1][1] - V[0][1]*V[1][0];
-      const Sdiag = [1,1]; if(detU * detV < 0) Sdiag[1] = -1;
-      const Vt = [[V[0][0], V[1][0]],[V[0][1], V[1][1]]];
-      const US = [[U[0][0]*Sdiag[0], U[0][1]*Sdiag[1]],[U[1][0]*Sdiag[0], U[1][1]*Sdiag[1]]];
-      const R = [[US[0][0]*Vt[0][0] + US[0][1]*Vt[1][0], US[0][0]*Vt[0][1] + US[0][1]*Vt[1][1]],[US[1][0]*Vt[0][0] + US[1][1]*Vt[1][0], US[1][0]*Vt[0][1] + US[1][1]*Vt[1][1]]];
-      let var_src = 0; for(let i=0;i<N;i++) var_src += Xc[i][0]*Xc[i][0] + Xc[i][1]*Xc[i][1]; var_src /= N;
-      const scale = (var_src < 1e-12) ? 1.0 : ((s1*Sdiag[0] + s2*Sdiag[1]) / var_src);
-      const RmuX = [ R[0][0]*muX[0] + R[0][1]*muX[1], R[1][0]*muX[0] + R[1][1]*muX[1] ];
-      const t = [ muY[0] - scale * RmuX[0], muY[1] - scale * RmuX[1] ];
-      return [[scale*R[0][0], scale*R[0][1], t[0]], [scale*R[1][0], scale*R[1][1], t[1]], [0,0,1]];
-    }
-
-    // ---------- EmbeddingTracker class (as provided) ----------
-    class EmbeddingTracker {
-      constructor(opts = {}) { this.matchThreshold = opts.matchThreshold ?? 0.62; this.galleryThreshold = opts.galleryThreshold ?? 0.58; this.iouThreshold = opts.iouThreshold ?? 0.45; this.maxAgeFrames = opts.maxAgeFrames ?? 150; this.embBufferSize = opts.embBufferSize ?? 8; this.minEmbForNewTrack = opts.minEmbForNewTrack ?? true; this.nextId = 1; this.tracks = {}; this.activeTrackIds = new Set(); }
-      _newId(){ return `P${this.nextId++}`; }
-      static cosine(a,b){ if(!a||!b||a.length!==b.length) return -1.0; let dot=0, na=0, nb=0; for(let i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; } return dot / (Math.sqrt(na)*Math.sqrt(nb) + 1e-10); }
-      static iou(b1,b2){ const x1=Math.max(b1.x,b2.x), y1=Math.max(b1.y,b2.y), x2=Math.min(b1.x+b1.w,b2.x+b2.w), y2=Math.min(b1.y+b1.h,b2.y+b2.h); const iw=Math.max(0,x2-x1), ih=Math.max(0,y2-y1); const inter=iw*ih, union=b1.w*b1.h+b2.w*b2.h-inter; return union<=0 ? 0 : inter/union; }
-      _computeMean(track){ if(!track.embBuffer || track.embBuffer.length===0) return null; const K=track.embBuffer.length, D=track.embBuffer[0].length; const mean=new Float32Array(D); for(let i=0;i<K;i++){ const e=track.embBuffer[i]; for(let d=0; d<D; d++) mean[d]+=e[d]; } for(let d=0; d<D; d++) mean[d]/=K; let norm=0; for(let d=0; d<D; d++) norm+=mean[d]*mean[d]; norm=Math.sqrt(norm)+1e-10; for(let d=0; d<D; d++) mean[d]/=norm; track.embMean=mean; return mean; }
-      _pushEmb(track, emb){ if(!emb) return; const e=(emb instanceof Float32Array) ? emb.slice(0) : new Float32Array(emb); if(!track.embBuffer) track.embBuffer=[]; track.embBuffer.push(e); if(track.embBuffer.length > this.embBufferSize) track.embBuffer.shift(); this._computeMean(track); }
-      _createTrack(det, frameIdx){ const id=this._newId(); const track={id, embBuffer:[], embMean:null, lastSeenFrame:frameIdx, bbox:det.bbox, active:true, createdAt:Date.now()}; if(det.emb) this._pushEmb(track, det.emb); this.tracks[id]=track; this.activeTrackIds.add(id); return track; }
-      _updateTrack(track, det, frameIdx){ track.lastSeenFrame=frameIdx; track.bbox=det.bbox; if(det.emb) this._pushEmb(track, det.emb); track.active=true; this.activeTrackIds.add(track.id); return track; }
-      prune(frameIdx){ for(const id in this.tracks){ const t=this.tracks[id]; if(frameIdx - t.lastSeenFrame > this.maxAgeFrames){ t.active=false; this.activeTrackIds.delete(id); } } }
-      getActiveTracks(){ return Array.from(this.activeTrackIds).map(id => this.tracks[id]); }
-      updateOne(det, frameIdx=0){ if(det.emb){ let best={id:null, score:-2}; for(const id of this.activeTrackIds){ const t=this.tracks[id]; if(!t.embMean) continue; const s=EmbeddingTracker.cosine(det.emb, t.embMean); if(s > best.score) best={id, score:s}; } if(best.id && best.score>=this.matchThreshold){ const t=this.tracks[best.id]; this._updateTrack(t,det,frameIdx); return {id:t.id, score:best.score, matchedBy:'emb'}; } let bestGal={id:null, score:-2}; for(const id in this.tracks){ const t=this.tracks[id]; if(!t.embMean) continue; const s=EmbeddingTracker.cosine(det.emb, t.embMean); if(s > bestGal.score) bestGal={id, score:s}; } if(bestGal.id && bestGal.score>=this.galleryThreshold){ const t=this.tracks[bestGal.id]; this._updateTrack(t,det,frameIdx); return {id:t.id, score:bestGal.score, matchedBy:'gallery'}; } } let bestIou={id:null, score:0}; for(const id of this.activeTrackIds){ const t=this.tracks[id]; const s=EmbeddingTracker.iou(t.bbox, det.bbox); if(s > bestIou.score) bestIou={id, score:s}; } if(bestIou.id && bestIou.score>=this.iouThreshold){ const t=this.tracks[bestIou.id]; this._updateTrack(t,det,frameIdx); return {id:t.id, score:bestIou.score, matchedBy:'iou'}; } if(det.emb || !this.minEmbForNewTrack){ const newTrack=this._createTrack(det,frameIdx); return {id:newTrack.id, score:null, matchedBy:'new'}; } return {id:null, score:null, matchedBy:'none'}; }
-      updateBatch(detections, frameIdx=0){ const assignments=[]; const idxs=detections.map((_,i)=>i).sort((a,b)=>(detections[b].emb?1:0)-(detections[a].emb?1:0)); for(const i of idxs){ const det=detections[i]; assignments[i]=this.updateOne(det, frameIdx); } this.prune(frameIdx); return assignments; }
-      saveGallery(key='face_gallery_v1'){ const dump=[]; for(const id in this.tracks){ const t=this.tracks[id]; if(t.embMean) dump.push({id:t.id, emb:Array.from(t.embMean), lastSeen:t.lastSeenFrame, createdAt:t.createdAt}); } localStorage.setItem(key, JSON.stringify(dump)); }
-      loadGallery(key='face_gallery_v1'){ const raw=localStorage.getItem(key); if(!raw) return; try{ const dump=JSON.parse(raw); for(const e of dump){ const t={id:e.id, embBuffer:[new Float32Array(e.emb)], embMean:new Float32Array(e.emb), lastSeenFrame:e.lastSeen??0, bbox:{x:0,y:0,w:0,h:0}, active:false, createdAt:e.createdAt??Date.now()}; this.tracks[t.id]=t; } const maxId=Object.keys(this.tracks).reduce((m,id)=>Math.max(m, parseInt(id.replace('P',''))), 0); if(maxId>=this.nextId) this.nextId=maxId+1; }catch(e){console.warn('loadGallery failed',e);} }
-    }
-
-    // ---------- load ONNX model ----------
-    status.textContent = 'Loading ONNX model...';
-    log('Loading ONNX model from', MODEL_PATH);
-    try {
-      session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl','wasm'] });
-      log('ONNX session created (webgl preferred if available).');
-    } catch(e){
-      log('ONNX webgl failed or unavailable, fallback to default:', e);
-      session = await ort.InferenceSession.create(MODEL_PATH);
-      log('ONNX session created (fallback).');
-    }
-    status.textContent = 'Model ready';
-    const inputName = session.inputNames[0];
-    const outputName = session.outputNames[0];
-
-    // ---------- instantiate tracker and load saved gallery ----------
-    tracker = new EmbeddingTracker(TRACKER_PARAMS);
-    tracker.loadGallery();
-    try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName')||'{}')); } catch(e){}
-
-    // ---------- MediaPipe setup ----------
-    faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
-    faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
-
-    // ---------- onResults definition (main processing loop) ----------
-    async function onResults(results){
-      if (isProcessing) return;
-      isProcessing = true;
-
+    async function onResults(results) {
       try {
         frameCounter++;
-        ctx.clearRect(0,0, overlay.width, overlay.height);
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
         ctx.drawImage(results.image, 0, 0, overlay.width, overlay.height);
 
-        if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0){
-          isProcessing = false;
+        if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
           return;
         }
+
         const facesLM = results.multiFaceLandmarks;
         const detections = [];
-        
         const tctx = tmpCanvas.getContext('2d');
         const actx = alignedTmpCanvas.getContext('2d');
         alignedTmpCanvas.width = EMBED_W;
         alignedTmpCanvas.height = EMBED_H;
 
-        for(let f=0; f<facesLM.length; f++){
+        for (let f = 0; f < facesLM.length; f++) {
           const landmarks = facesLM[f];
           const pts = landmarks.map(l => [l.x * VIDEO_W, l.y * VIDEO_H]);
-          const key5 = [ pts[33], pts[263], pts[1], pts[61], pts[291] ];
+          const key5 = [pts[33], pts[263], pts[1], pts[61], pts[291]];
           drawPoints(ctx, key5, 'red', 2);
 
-          let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
-          for(const p of pts){ if(p[0]<minx) minx=p[0]; if(p[1]<miny) miny=p[1]; if(p[0]>maxx) maxx=p[0]; if(p[1]>maxy) maxy=p[1]; }
-          const cx=(minx+maxx)/2, cy=(miny+maxy)/2;
-          let size = Math.max(maxx-minx, maxy-miny) * PAD_FACTOR;
+          let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+          for (const p of pts) { if (p[0] < minx) minx = p[0]; if (p[1] < miny) miny = p[1]; if (p[0] > maxx) maxx = p[0]; if (p[1] > maxy) maxy = p[1]; }
+          const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
+          let size = Math.max(maxx - minx, maxy - miny) * PAD_FACTOR;
           size = Math.max(size, 40);
-          let x0=Math.round(cx-size/2), y0=Math.round(cy-size/2), w=Math.round(size), h=Math.round(size);
-          if(x0<0){w+=x0;x0=0;} if(y0<0){h+=y0;y0=0;}
-          if(x0+w>VIDEO_W)w=VIDEO_W-x0; if(y0+h>VIDEO_H)h=VIDEO_H-y0;
-          if(w<=0||h<=0) continue;
+          let x0 = Math.round(cx - size / 2), y0 = Math.round(cy - size / 2), w = Math.round(size), h = Math.round(size);
+          if (x0 < 0) { w += x0; x0 = 0; } if (y0 < 0) { h += y0; y0 = 0; }
+          if (x0 + w > VIDEO_W) w = VIDEO_W - x0; if (y0 + h > VIDEO_H) h = VIDEO_H - y0;
+          if (w <= 0 || h <= 0) continue;
 
-          ctx.strokeStyle='lime'; ctx.lineWidth=2; ctx.strokeRect(x0,y0,w,h);
+          ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(x0, y0, w, h);
 
-          tmpCanvas.width=w; tmpCanvas.height=h;
+          tmpCanvas.width = w; tmpCanvas.height = h;
           tctx.drawImage(video, x0, y0, w, h, 0, 0, w, h);
 
-          const src5_resized = key5.map(p => [(p[0]-x0)*(EMBED_W/w), (p[1]-y0)*(EMBED_H/h)]);
+          const src5_resized = key5.map(p => [(p[0] - x0) * (EMBED_W / w), (p[1] - y0) * (EMBED_H / h)]);
           const M = umeyama(src5_resized, CANONICAL_5);
           
-          actx.clearRect(0,0,EMBED_W,EMBED_H);
+          actx.clearRect(0, 0, EMBED_W, EMBED_H);
           actx.save();
-          actx.setTransform(M[0][0],M[1][0],M[0][1],M[1][1],M[0][2],M[1][2]);
+          actx.setTransform(M[0][0], M[1][0], M[0][1], M[1][1], M[0][2], M[1][2]);
           actx.drawImage(tmpCanvas, 0, 0, w, h);
           actx.restore();
 
-          if(f === 0){ // Only show thumbnail for the first face to save resources
-            alignedThumbCtx.clearRect(0,0, EMBED_W, EMBED_H);
+          if (f === 0) {
+            alignedThumbCtx.clearRect(0, 0, EMBED_W, EMBED_H);
             alignedThumbCtx.drawImage(alignedTmpCanvas, 0, 0, EMBED_W, EMBED_H);
           }
-
-          detections.push({ bbox: {x:x0,y:y0,w:w,h:h}, alignedCanvas: alignedTmpCanvas, emb: null });
+          detections.push({ bbox: { x: x0, y: y0, w: w, h: h }, alignedCanvas: alignedTmpCanvas, emb: null });
         }
 
         const doEmb = (frameCounter % Math.max(1, parseInt(procEveryInput.value || '2', 10))) === 0;
-        if(detections.length > 0 && doEmb){
-          for(let i=0;i<detections.length;i++){
-            try {
-              const idata = detections[i].alignedCanvas.getContext('2d').getImageData(0,0,EMBED_W,EMBED_H);
-              const tensor = imageDataToTensor(idata);
-              const out = await session.run({[inputName]: tensor});
-              const embArr = out[outputName].data;
-              const f = new Float32Array(embArr.length);
-              let norm=0; for(let k=0;k<embArr.length;k++){ norm+=embArr[k]*embArr[k]; f[k]=embArr[k]; }
-              norm=Math.sqrt(norm)+1e-10;
-              for(let k=0;k<f.length;k++) f[k]/=norm;
-              detections[i].emb = f;
-            } catch(e){
-              console.error('embedding extraction error', e);
-            }
+        if (detections.length > 0 && doEmb) {
+          const inputName = session.inputNames[0];
+          const outputName = session.outputNames[0];
+          for (let i = 0; i < detections.length; i++) {
+            const idata = detections[i].alignedCanvas.getContext('2d').getImageData(0, 0, EMBED_W, EMBED_H);
+            const tensor = imageDataToTensor(idata);
+            const out = await session.run({ [inputName]: tensor });
+            const embArr = out[outputName].data;
+            const f = new Float32Array(embArr.length);
+            let norm = 0; for (let k = 0; k < embArr.length; k++) { norm += embArr[k] * embArr[k]; f[k] = embArr[k]; }
+            norm = Math.sqrt(norm) + 1e-10;
+            for (let k = 0; k < f.length; k++) f[k] /= norm;
+            detections[i].emb = f;
           }
         }
 
         const assignments = tracker.updateBatch(detections, frameCounter);
-        for(let i=0;i<detections.length;i++){
+        for (let i = 0; i < detections.length; i++) {
           const a = assignments[i];
           const det = detections[i];
           let label = 'unknown';
-          if(a && a.id){
+          if (a && a.id) {
             const human = idToName[a.id] || a.id;
             label = a.score ? `${human} ${a.score.toFixed(2)}` : human;
           }
-          ctx.fillStyle='yellow'; ctx.font='16px Arial';
-          ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y-6));
-          if(a && a.id){
-            ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(det.bbox.x+det.bbox.w-70, det.bbox.y+det.bbox.h-20, 70, 20);
-            ctx.fillStyle='white'; ctx.fillText(a.id, det.bbox.x+det.bbox.w-64, det.bbox.y+det.bbox.h-6);
+          ctx.fillStyle = 'yellow'; ctx.font = '16px Arial';
+          ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y - 6));
+          if (a && a.id) {
+            ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(det.bbox.x + det.bbox.w - 70, det.bbox.y + det.bbox.h - 20, 70, 20);
+            ctx.fillStyle = 'white'; ctx.fillText(a.id, det.bbox.x + det.bbox.w - 64, det.bbox.y + det.bbox.h - 6);
           }
         }
       } catch (err) {
@@ -306,38 +182,46 @@
       }
     }
 
-    // ---------- register onResults and start camera ----------
+    // ---------- Initialization and Startup ----------
+    status.textContent = 'Loading ONNX model...';
+    try {
+      session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl', 'wasm'] });
+      log('ONNX session created.');
+    } catch (e) {
+      log('Error loading ONNX session:', e);
+      status.textContent = 'Error loading model.';
+      return;
+    }
+    status.textContent = 'Model ready';
+
+    tracker = new EmbeddingTracker(TRACKER_PARAMS);
+    tracker.loadGallery();
+    try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName') || '{}')); } catch (e) {}
+
+    faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+    faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
     faceMesh.onResults(onResults);
-    camera = new Camera(video, { onFrame: async () => { await faceMesh.send({image: video}); }, width: VIDEO_W, height: VIDEO_H });
+
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        if (isProcessing) {
+          return;
+        }
+        isProcessing = true;
+        await faceMesh.send({ image: video });
+      },
+      width: VIDEO_W,
+      height: VIDEO_H
+    });
     await camera.start();
     log('Camera started. Ready.');
 
     // ---------- UI Event Listeners ----------
-    document.getElementById('enrollBtn').onclick = () => {
-      const active = tracker.getActiveTracks().sort((a,b) => (b.bbox.w*b.bbox.h) - (a.bbox.w*a.bbox.h));
-      if(active.length === 0){ alert('No active face to enroll'); return; }
-      const t = active[0];
-      const name = prompt('Enter name for this person (leave blank to use track ID):');
-      const label = (name && name.trim().length>0) ? name.trim() : t.id;
-      idToName[t.id] = label;
-      try { localStorage.setItem('idToName', JSON.stringify(idToName)); tracker.saveGallery(); log('Enrolled', t.id, 'as', label); } catch(e){ console.warn('save failed', e); }
-    };
+    document.getElementById('enrollBtn').onclick = () => { const active = tracker.getActiveTracks().sort((a,b) => (b.bbox.w*b.bbox.h) - (a.bbox.w*a.bbox.h)); if(active.length === 0){ alert('No active face to enroll'); return; } const t = active[0]; const name = prompt('Enter name for this person:'); const label = (name && name.trim().length>0) ? name.trim() : t.id; idToName[t.id] = label; try { localStorage.setItem('idToName', JSON.stringify(idToName)); tracker.saveGallery(); log('Enrolled', t.id, 'as', label); } catch(e){ console.warn('save failed', e); } };
+    document.getElementById('clearGalleryBtn').onclick = () => { if(confirm('Clear saved gallery and labels?')){ localStorage.removeItem('face_gallery_v1'); localStorage.removeItem('idToName'); tracker = new EmbeddingTracker(TRACKER_PARAMS); for(const k in idToName) delete idToName[k]; log('Cleared saved gallery and labels'); } };
+    window.addEventListener('beforeunload', () => { try { tracker.saveGallery(); localStorage.setItem('idToName', JSON.stringify(idToName)); } catch(e){} });
 
-    document.getElementById('clearGalleryBtn').onclick = () => {
-      if(confirm('Clear saved gallery and labels (localStorage)?')){
-        localStorage.removeItem('face_gallery_v1');
-        localStorage.removeItem('idToName');
-        tracker = new EmbeddingTracker(TRACKER_PARAMS);
-        for(const k in idToName) delete idToName[k];
-        log('Cleared saved gallery and labels');
-      }
-    };
-
-    window.addEventListener('beforeunload', () => {
-      try { tracker.saveGallery(); localStorage.setItem('idToName', JSON.stringify(idToName)); } catch(e){}
-    });
-
-    log('Setup complete. Use enroll to assign names.');
+    log('Setup complete.');
   })();
   </script>
 </body>
