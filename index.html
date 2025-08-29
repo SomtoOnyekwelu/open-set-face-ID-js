@@ -3,90 +3,402 @@
 
 <head>
   <meta charset="utf-8" />
-  <title>Face Demo — Detector+Mesh + ONNX + Tracker</title>
+  <title>Face Demo — Detector+Mesh + ONNX + Tracker (Enroll Confirm + Export/Import)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 8px;
+    :root {
+      --main-w: 900px;
+      --main-h: 675px;
+      --compact-w: 640px;
+      --compact-h: 480px;
+      --gap: 12px;
+      --accent: #1E90FF;
     }
 
-    #row {
+    body {
+      font-family: Arial, sans-serif;
+      margin: 12px;
+      background: #f6f8fa;
+      color: #111;
+    }
+
+    header {
       display: flex;
-      gap: 12px;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    #controlsTop {
+      margin-left: auto;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    /* layout containers */
+    #page {
+      display: flex;
+      gap: var(--gap);
       align-items: flex-start;
     }
 
-    #videoWrap {
+    #mainArea {
+      order: 1;
+    }
+
+    #debugArea {
+      order: 2;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* main display */
+    .mainVideoWrap {
       position: relative;
     }
 
     video,
     canvas {
-      width: 640px;
-      height: 480px;
+      background: #000;
+      display: block;
       border: 1px solid #333;
+    }
+
+    #mainVideo {
+      width: var(--main-w);
+      height: var(--main-h);
       background: #000;
     }
 
-    #controls {
-      margin-top: 8px;
+    #mainOverlay {
+      position: absolute;
+      left: 0;
+      top: 0;
+      pointer-events: none;
     }
 
-    button {
-      padding: 8px 12px;
-      margin-right: 8px;
+    /* compact sizes (debug ON) */
+    body.debug-on #mainVideo {
+      width: var(--compact-w);
+      height: var(--compact-h);
     }
 
-    .small {
+    body.debug-on #mainOverlay {
+      width: var(--compact-w);
+      height: var(--compact-h);
+    }
+
+    body.debug-on #debugArea {
+      display: flex;
+    }
+
+    /* expanded sizes (debug OFF): hide debugArea and show larger main */
+    body.debug-off #debugArea {
+      display: none;
+    }
+
+    body.debug-off #mainVideo {
+      width: var(--main-w);
+      height: var(--main-h);
+    }
+
+    body.debug-off #mainOverlay {
+      width: var(--main-w);
+      height: var(--main-h);
+    }
+
+    /* debug area small items */
+    #debugArea {
+      min-width: 320px;
+    }
+
+    .smallCanvas {
       width: 112px;
       height: 112px;
       border: 1px solid #666;
+      background: #000;
       display: block;
+    }
+
+    #log {
+      min-width: 320px;
+      max-width: 420px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+      border: 1px solid #ddd;
+      padding: 8px;
+      background: #fafafa;
+    }
+
+    .control-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
       margin-top: 6px;
     }
 
     label {
       font-size: 13px;
     }
+
+    /* transient notice */
+    #firstNotice {
+      background: #fffbe6;
+      border: 1px solid #ffd700;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      color: #333;
+      font-weight: 600;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    /* modal/backdrop */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 60;
+    }
+
+    .modal {
+      background: white;
+      max-width: 420px;
+      width: 92%;
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+      max-height: 86vh;
+      overflow: auto;
+    }
+
+    .modal h3 {
+      margin-top: 0;
+    }
+
+    .modal .modal-footer {
+      margin-top: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* help button */
+    #helpBtn {
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      z-index: 80;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 24px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 18px rgba(30, 144, 255, 0.18);
+    }
+
+    /* identity label style - big & high contrast */
+    .idLabelBg {
+      fillStyle: 'rgba(0,0,0,0.75)';
+    }
+
+    /* privacy notice */
+    #privacyNote {
+      font-size: 12px;
+      color: #333;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      padding: 6px 8px;
+      border-radius: 6px;
+      margin-left: 12px;
+    }
+
+    /* toast */
+    #toast {
+      position: fixed;
+      right: 18px;
+      bottom: 80px;
+      z-index: 90;
+      min-width: 200px;
+      max-width: 320px;
+      background: rgba(0, 0, 0, 0.8);
+      color: white;
+      padding: 10px 12px;
+      border-radius: 8px;
+      display: none;
+      font-weight: 600;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+    }
+
+    /* responsive fallback */
+    @media (max-width:1100px) {
+      :root {
+        --main-w: 640px;
+        --main-h: 480px;
+      }
+    }
   </style>
 </head>
 
-<body>
-  <h2>Face Demo — Detector bbox crop → resize → 5-pt Umeyama align → ONNX embeddings → Tracker</h2>
+<body class="debug-off">
+  <header>
+    <h2>Face Demo — Detector bbox → 5-pt Umeyama → ONNX embeddings → Tracker</h2>
 
-  <div id="row">
-    <div id="videoWrap">
-      <video id="video" autoplay muted playsinline></video>
-      <canvas id="overlay"></canvas>
+    <div id="controlsTop">
+      <label><input id="debugToggle" type="checkbox"> Debug</label>
+
+      <button id="enrollBtn">Enroll (largest face)</button>
+      <button id="clearGalleryBtn">Clear gallery</button>
+
+      <label>Process every
+        <input id="procEvery" type="number" min="1" max="10" value="2" style="width:48px">
+      </label>
+
+      <label>Similarity threshold
+        <input id="simThreshold" type="range" min="0.40" max="0.95" step="0.01" value="0.62" style="width:120px">
+        <span id="simThresholdValue">0.62</span>
+      </label>
+
+      <label>Match scale
+        <input id="acceptScale" type="number" step="0.1" min="0.1" value="1.8" style="width:64px">
+      </label>
+
+      <!-- export/import -->
+      <button id="exportGalleryBtn" title="Export saved gallery to a JSON file">Export Gallery</button>
+      <button id="importGalleryBtn" title="Import gallery JSON (will replace local gallery)">Import Gallery</button>
+      <input id="importFileInput" type="file" accept=".json" style="display:none">
+
+      <div id="status" style="margin-left:8px; font-size:13px;">Loading models...</div>
     </div>
 
-    <div id="controlsWrap">
-      <canvas id="alignedThumb" class="small" title="Aligned 112x112 preview"></canvas>
-      <div id="controls">
-        <button id="enrollBtn">Enroll (name largest face)</button>
-        <button id="clearGalleryBtn">Clear gallery</button>
-        <div style="margin-top:8px;">
-          <label>Process every N frames:
-            <input id="procEvery" type="number" min="1" max="10" value="2" style="width:48px">
-          </label>
-        </div>
-        <div style="margin-top:8px;">
-          <label>Accept scale for det→mesh match:
-            <input id="acceptScale" type="number" step="0.1" min="0.1" value="1.8" style="width:64px">
-          </label>
-        </div>
-      </div>
-      <div id="status" style="margin-top:8px">Loading models...</div>
+    <div id="privacyNote" title="Privacy info">Privacy: your embeddings & labels are stored only in this browser
+      (localStorage). You can export and delete them at any time.</div>
+  </header>
+
+  <div id="firstNotice" style="display:none;">
+    <div>⚠️</div>
+    <div>
+      <div style="font-weight:700">Please be patient</div>
+      <div style="font-size:13px; color:#333">The first run loads WASM/WebGL code and the ONNX model — it may take
+        several seconds. Subsequent loads are faster.</div>
     </div>
   </div>
 
-  <!-- MediaPipe Face Detection + Face Mesh + Camera Utils -->
+  <div id="page">
+    <!-- MAIN AREA -->
+    <div id="mainArea">
+      <div class="mainVideoWrap">
+        <video id="mainVideo" autoplay muted playsinline></video>
+        <canvas id="mainOverlay"></canvas>
+      </div>
+    </div>
+
+    <!-- DEBUG AREA -->
+    <div id="debugArea" style="display:none;">
+      <div>
+        <div style="font-weight:600; margin-bottom:6px;">Raw camera (no overlay)</div>
+        <video id="rawVideo" autoplay muted playsinline
+          style="width:320px;height:240px;border:1px solid #333;background:#000;"></video>
+      </div>
+
+      <div>
+        <div style="font-weight:600; margin-bottom:6px;">Aligned 112×112</div>
+        <canvas id="alignedThumb" class="smallCanvas" width="112" height="112"></canvas>
+      </div>
+
+      <div>
+        <div style="font-weight:600; margin-bottom:6px;">Debug log</div>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Enroll confirmation modal -->
+  <div id="enrollModal" class="modal-backdrop" style="display:none;">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="enrollTitle">
+      <h3 id="enrollTitle">Confirm Enroll</h3>
+      <div style="display:flex;gap:12px;align-items:center;">
+        <canvas id="enrollPreviewCanvas" width="112" height="112"
+          style="border:1px solid #ccc;background:#000;"></canvas>
+        <div style="flex:1;">
+          <div id="enrollInfo" style="font-size:14px;margin-bottom:8px;">Track: <strong id="enrollTrackId">—</strong>
+            <span id="enrollScore" style="color:#666;font-weight:600"></span>
+          </div>
+          <div>
+            <label for="enrollName">Name:</label><br>
+            <input id="enrollName" type="text" style="width:100%;padding:8px;margin-top:6px;font-size:14px"
+              placeholder="Enter display name (optional)">
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <div>
+          <button id="enrollCancelBtn">Cancel</button>
+        </div>
+        <div>
+          <button id="enrollConfirmBtn"
+            style="background:var(--accent);color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer">Confirm
+            Enroll</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- onboarding modal -->
+  <div id="onboardModal" class="modal-backdrop" style="display:none;">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="onboardTitle">
+      <h3 id="onboardTitle">Welcome — Quick walkthrough</h3>
+      <div class="steps">
+        <ol>
+          <li><strong>First load may be slow:</strong> please wait while the model and WebAssembly code load. After the
+            first load, it will be faster.</li>
+          <li><strong>Enroll:</strong> Click <em>Enroll</em> when the person you want to label is the largest face on
+            screen. Confirm the preview and name in the dialog.</li>
+          <li><strong>Similarity threshold:</strong> Controls how similar an embedding must be to match an existing
+            identity. Lower value → more permissive; higher → more strict.</li>
+          <li><strong>Match scale:</strong> Controls how strictly the detector bbox is associated with face-mesh
+            landmarks. Keep default unless you see mismatches.</li>
+          <li><strong>Export / Import Gallery:</strong> Use Export to save your local gallery as JSON. Use Import to
+            restore a previously exported JSON (this will replace the current local gallery after confirmation).</li>
+          <li><strong>Privacy:</strong> All data (embeddings, labels) are stored only on your device in your browser
+            localStorage. You control it — export, delete or clear it at any time.</li>
+        </ol>
+      </div>
+
+      <div class="modal-footer">
+        <label><input id="dontShowAgain" type="checkbox"> Don't show again</label>
+        <div style="margin-left:auto">
+          <button id="closeOnboard">Start</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button id="helpBtn" title="Open help/walkthrough">Help</button>
+
+  <div id="toast"></div>
+
+  <!-- libs -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
-
-  <!-- ONNX Runtime Web -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 
   <script>
@@ -102,55 +414,93 @@
         [33.5493, 92.3655],
         [62.7299, 92.2041]
       ];
+      const GALLERY_KEY = 'face_gallery_v1';
+      const NAME_KEY = 'idToName_v1';
       const TRACKER_PARAMS = { matchThreshold: 0.62, galleryThreshold: 0.58, iouThreshold: 0.45, maxAgeFrames: 300, embBufferSize: 6, minEmbForNewTrack: true };
       // ---------- END CONFIG ----------
 
-      // DOM elements
-      const video = document.getElementById('video');
-      const overlay = document.getElementById('overlay');
-      overlay.width = VIDEO_W; overlay.height = VIDEO_H;
-      const ctx = overlay.getContext('2d');
+      // DOM
+      const mainVideo = document.getElementById('mainVideo');
+      const mainOverlay = document.getElementById('mainOverlay');
+      const rawVideo = document.getElementById('rawVideo');
       const alignedThumb = document.getElementById('alignedThumb');
-      alignedThumb.width = EMBED_W; alignedThumb.height = EMBED_H;
-      const alignedThumbCtx = alignedThumb.getContext('2d');
+      const logEl = document.getElementById('log');
       const status = document.getElementById('status');
+      const debugToggle = document.getElementById('debugToggle');
       const procEveryInput = document.getElementById('procEvery');
       const acceptScaleInput = document.getElementById('acceptScale');
+      const simThresholdInput = document.getElementById('simThreshold');
+      const simThresholdValue = document.getElementById('simThresholdValue');
+      const firstNotice = document.getElementById('firstNotice');
+      const onboardModal = document.getElementById('onboardModal');
+      const helpBtn = document.getElementById('helpBtn');
+      const exportBtn = document.getElementById('exportGalleryBtn');
+      const importBtn = document.getElementById('importGalleryBtn');
+      const importFileInput = document.getElementById('importFileInput');
 
-      // state
-      let session = null;
-      let tracker = null;
-      let frameCounter = 0;
-      let faceDetector = null;
-      let faceMesh = null;
-      let camera = null;
-      let latestDetections = null;
-      const idToName = {};
+      // enroll modal elements
+      const enrollModal = document.getElementById('enrollModal');
+      const enrollPreviewCanvas = document.getElementById('enrollPreviewCanvas');
+      const enrollTrackIdEl = document.getElementById('enrollTrackId');
+      const enrollScoreEl = document.getElementById('enrollScore');
+      const enrollNameInput = document.getElementById('enrollName');
+      const enrollCancelBtn = document.getElementById('enrollCancelBtn');
+      const enrollConfirmBtn = document.getElementById('enrollConfirmBtn');
+      const enrollBtn = document.getElementById('enrollBtn');
 
-      // small helpers
-      function drawPoints(ctx, pts, color = 'lime', size = 2) {
-        ctx.fillStyle = color;
-        for (const p of pts) { if (!p || !isFinite(p[0]) || !isFinite(p[1])) continue; ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI * 2); ctx.fill(); }
+      function resizeOverlayToMain() {
+        const rect = mainVideo.getBoundingClientRect();
+        mainOverlay.width = rect.width;
+        mainOverlay.height = rect.height;
+        mainOverlay.style.left = mainVideo.offsetLeft + 'px';
+        mainOverlay.style.top = mainVideo.offsetTop + 'px';
       }
 
-      function imageDataToTensor(imgData) {
-        const { data, width, height } = imgData;
-        const plane = width * height;
-        const buf = new Float32Array(3 * plane);
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            const i = (y * width + x) * 4;
-            const r = data[i], g = data[i + 1], b = data[i + 2];
-            const pix = y * width + x;
-            buf[pix] = r / 127.5 - 1.0;
-            buf[plane + pix] = g / 127.5 - 1.0;
-            buf[2 * plane + pix] = b / 127.5 - 1.0;
-          }
+      // debug flag & logger
+      let debugMode = false;
+      function log(...args) {
+        console.debug(...args);
+        if (!debugMode) return;
+        const s = args.map(a => (typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a))).join(' ');
+        logEl.textContent += s + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setDebugMode(on) {
+        debugMode = on;
+        document.body.classList.toggle('debug-on', on);
+        document.body.classList.toggle('debug-off', !on);
+        document.getElementById('debugArea').style.display = on ? 'flex' : 'none';
+        if (on) { logEl.textContent = ''; log('Debug mode ON'); }
+      }
+      debugToggle.addEventListener('change', (e) => setDebugMode(e.target.checked));
+      setDebugMode(false);
+
+      window.addEventListener('resize', () => resizeOverlayToMain());
+      setInterval(resizeOverlayToMain, 800);
+
+      // ---------- transient first-run notice ----------
+      function showFirstNoticeOnce() {
+        const key = 'seen_first_notice_v1';
+        if (!localStorage.getItem(key)) {
+          firstNotice.style.display = 'flex';
+          setTimeout(() => { firstNotice.style.display = 'none'; localStorage.setItem(key, '1'); }, 6000);
         }
-        return new ort.Tensor('float32', buf, [1, 3, height, width]);
       }
+      showFirstNoticeOnce();
 
-      // Umeyama for 2D (kept identical)
+      // ---------- onboarding modal ----------
+      function showOnboardModal() { onboardModal.style.display = 'flex'; }
+      function hideOnboardModal() { const dont = document.getElementById('dontShowAgain'); if (dont && dont.checked) localStorage.setItem('suppress_onboard_v1', '1'); onboardModal.style.display = 'none'; }
+      document.getElementById('closeOnboard').addEventListener('click', hideOnboardModal);
+      helpBtn.addEventListener('click', showOnboardModal);
+      if (!localStorage.getItem('suppress_onboard_v1')) showOnboardModal();
+
+      // ---------- remember last frame (fix for enroll race) ----------
+      let _lastFrameDetections = null;
+      let _lastFrameAssignments = null;
+
+      // ---------- Umeyama & tracker classes ----------
       function umeyama(srcPts, dstPts) {
         const N = srcPts.length;
         if (N < 2) throw new Error('umeyama requires >=2 points');
@@ -209,7 +559,6 @@
         ];
       }
 
-      // EmbeddingTracker class (unchanged)
       class EmbeddingTracker {
         constructor(opts = {}) {
           this.matchThreshold = opts.matchThreshold ?? 0.62;
@@ -247,35 +596,10 @@
           return { id: null, score: null, matchedBy: 'none' };
         }
         updateBatch(detections, frameIdx = 0) { const assignments = []; const idxs = detections.map((_, i) => i).sort((a, b) => (detections[b].emb ? 1 : 0) - (detections[a].emb ? 1 : 0)); for (const i of idxs) { const det = detections[i]; assignments[i] = this.updateOne(det, frameIdx); } this.prune(frameIdx); return assignments; }
-        saveGallery(key = 'face_gallery_v1') { const dump = []; for (const id in this.tracks) { const t = this.tracks[id]; if (t.embMean) dump.push({ id: t.id, emb: Array.from(t.embMean), lastSeen: t.lastSeenFrame, createdAt: t.createdAt }); } localStorage.setItem(key, JSON.stringify(dump)); }
-        loadGallery(key = 'face_gallery_v1') { const raw = localStorage.getItem(key); if (!raw) return; try { const dump = JSON.parse(raw); for (const e of dump) { const t = { id: e.id, embBuffer: [new Float32Array(e.emb)], embMean: new Float32Array(e.emb), lastSeenFrame: e.lastSeen ?? 0, bbox: { x: 0, y: 0, w: 0, h: 0 }, active: false, createdAt: e.createdAt ?? Date.now() }; this.tracks[t.id] = t; } const maxId = Object.keys(this.tracks).reduce((m, id) => Math.max(m, parseInt(id.replace('P', ''))), 0); if (maxId >= this.nextId) this.nextId = maxId + 1; } catch (e) { console.warn('loadGallery failed', e); } }
+        saveGallery(key = GALLERY_KEY) { const dump = []; for (const id in this.tracks) { const t = this.tracks[id]; if (t.embMean) dump.push({ id: t.id, emb: Array.from(t.embMean), lastSeen: t.lastSeenFrame, createdAt: t.createdAt }); } localStorage.setItem(key, JSON.stringify(dump)); }
+        loadGallery(key = GALLERY_KEY) { const raw = localStorage.getItem(key); if (!raw) return; try { const dump = JSON.parse(raw); this.tracks = {}; this.activeTrackIds.clear(); this.nextId = 1; for (const e of dump) { const t = { id: e.id, embBuffer: [new Float32Array(e.emb)], embMean: new Float32Array(e.emb), lastSeenFrame: e.lastSeen ?? 0, bbox: { x: 0, y: 0, w: 0, h: 0 }, active: false, createdAt: e.createdAt ?? Date.now() }; this.tracks[t.id] = t; const idnum = parseInt(t.id.replace(/[^\d]/g, '')) || 0; if (idnum >= this.nextId) this.nextId = idnum + 1; } } catch (e) { console.warn('loadGallery failed', e); } }
       } // end tracker
 
-      // ---------- load ONNX ----------
-      status.textContent = 'Loading ONNX model...';
-      try {
-        session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl', 'wasm'] });
-      } catch (e) {
-        session = await ort.InferenceSession.create(MODEL_PATH);
-      }
-      status.textContent = 'Model ready';
-      const inputName = session.inputNames[0];
-      const outputName = session.outputNames[0];
-
-      // ---------- instantiate tracker & restore gallery/names ----------
-      tracker = new EmbeddingTracker(TRACKER_PARAMS);
-      tracker.loadGallery();
-      try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName') || '{}')); } catch (e) { }
-
-      // ---------- MediaPipe setup ----------
-      faceDetector = new FaceDetection({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}` });
-      faceDetector.setOptions({ model: 'short', minDetectionConfidence: 0.5 });
-      faceDetector.onResults((res) => { latestDetections = res; });
-
-      faceMesh = new FaceMesh({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
-      faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
-
-      // ---------- detection->pixel bbox conversion ----------
       function detectionToBBox(detection) {
         if (!detection) return null;
         if (detection.boundingBox) {
@@ -324,7 +648,6 @@
         return null;
       }
 
-      // crop->resize->align (safe fallback)
       function cropResizeAlignFromBox(videoEl, bbox, landmarksVideoPts, canonical5, EMBED_W = 112, EMBED_H = 112) {
         if (!bbox) return null;
         let x = Math.round(bbox.x), y = Math.round(bbox.y), w = Math.round(bbox.w), h = Math.round(bbox.h);
@@ -350,23 +673,75 @@
         return aligned;
       }
 
-      // ---------- FACE MESH processing ----------
+      function imageDataToTensor(imgData) {
+        const { data, width, height } = imgData;
+        const plane = width * height;
+        const buf = new Float32Array(3 * plane);
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            const pix = y * width + x;
+            buf[pix] = r / 127.5 - 1.0;
+            buf[plane + pix] = g / 127.5 - 1.0;
+            buf[2 * plane + pix] = b / 127.5 - 1.0;
+          }
+        }
+        return new ort.Tensor('float32', buf, [1, 3, height, width]);
+      }
+
+      // ---------- model load ----------
+      status.textContent = 'Loading ONNX model and MediaPipe... (first load may be slow)';
+      firstNotice.style.display = 'flex';
+      setTimeout(() => { firstNotice.style.display = 'none'; }, 7000);
+
+      let session = null;
+      try {
+        session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl', 'wasm'] });
+      } catch (e) {
+        session = await ort.InferenceSession.create(MODEL_PATH);
+      }
+      const inputName = session.inputNames[0];
+      const outputName = session.outputNames[0];
+      status.textContent = 'Model ready';
+
+      const tracker = new EmbeddingTracker(TRACKER_PARAMS);
+      tracker.loadGallery();
+      let idToName = {};
+      try { idToName = JSON.parse(localStorage.getItem(NAME_KEY) || '{}'); } catch (e) { idToName = {}; }
+
+      // ---------- mediapipe setup ----------
+      let latestDetections = null;
+      const faceDetector = new FaceDetection({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}` });
+      faceDetector.setOptions({ model: 'short', minDetectionConfidence: 0.5 });
+      faceDetector.onResults((res) => { latestDetections = res; if (debugMode) log('[detector] detections=', (res && res.detections) ? res.detections.length : 0); });
+
+      const faceMesh = new FaceMesh({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+      faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+      const mainCtx = mainOverlay.getContext('2d');
+      function drawPoints(ctx, pts, color = 'lime', size = 2) {
+        ctx.fillStyle = color;
+        for (const p of pts) { if (!p || !isFinite(p[0]) || !isFinite(p[1])) continue; ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI * 2); ctx.fill(); }
+      }
+
+      // ---------- faceMesh processing ----------
+      let frameCounter = 0;
       faceMesh.onResults(async (meshResults) => {
         try {
           frameCounter++;
-          ctx.clearRect(0, 0, overlay.width, overlay.height);
-          ctx.drawImage(meshResults.image, 0, 0, overlay.width, overlay.height);
+          resizeOverlayToMain();
+          mainCtx.clearRect(0, 0, mainOverlay.width, mainOverlay.height);
+          mainCtx.drawImage(meshResults.image, 0, 0, mainOverlay.width, mainOverlay.height);
 
           if (!latestDetections || !Array.isArray(latestDetections.detections) || latestDetections.detections.length === 0) {
+            // still draw camera image but no detections
+            _lastFrameDetections = null;
+            _lastFrameAssignments = null;
             return;
           }
 
-          const detBboxes = [];
-          for (const det of latestDetections.detections) {
-            const bb = detectionToBBox(det);
-            detBboxes.push(bb);
-          }
-
+          const detBboxes = latestDetections.detections.map(det => detectionToBBox(det));
           const meshList = Array.isArray(meshResults.multiFaceLandmarks) ? meshResults.multiFaceLandmarks.filter(m => Array.isArray(m) && m.length > 0) : [];
           const meshCentroids = meshList.map(landmarks => {
             let sx = 0, sy = 0, cnt = 0;
@@ -410,13 +785,12 @@
               if (ok) fivePts = indices.map(i => [lm[i].x * VIDEO_W, lm[i].y * VIDEO_H]);
               else fivePts = null;
             }
-            const alignedCanvas = cropResizeAlignFromBox(video, bbox, fivePts, CANONICAL_5, EMBED_W, EMBED_H);
+            const alignedCanvas = cropResizeAlignFromBox(mainVideo, bbox, fivePts, CANONICAL_5, EMBED_W, EMBED_H);
             detections.push({ bbox, alignedCanvas, emb: null, meshIdx });
           }
 
           const processEvery = Math.max(1, parseInt(procEveryInput.value || '2', 10));
           const doEmb = (frameCounter % processEvery) === 0;
-
           if (doEmb) {
             for (let i = 0; i < detections.length; i++) {
               const det = detections[i];
@@ -438,88 +812,235 @@
             }
           }
 
+          // update thresholds live from UI
+          const simThresh = parseFloat(simThresholdInput.value);
+          tracker.matchThreshold = simThresh;
+          tracker.galleryThreshold = Math.max(0.48, simThresh - 0.04); // slightly looser gallery
+
           const assignments = tracker.updateBatch(detections, frameCounter);
 
-          // draw boxes, landmarks, labels
+          // --- store the exact arrays used to draw this frame so enroll picks correct ID ---
+          _lastFrameDetections = detections;
+          _lastFrameAssignments = assignments;
+
+          // draw
           for (let i = 0; i < detections.length; i++) {
             const det = detections[i];
             const a = assignments[i];
-            ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
+            const scaleX = mainOverlay.width / VIDEO_W, scaleY = mainOverlay.height / VIDEO_H;
+            mainCtx.strokeStyle = 'lime'; mainCtx.lineWidth = 2; mainCtx.strokeRect(det.bbox.x * scaleX, det.bbox.y * scaleY, det.bbox.w * scaleX, det.bbox.h * scaleY);
+
             if (det.meshIdx !== null && det.meshIdx !== undefined && meshList[det.meshIdx]) {
               const lm = meshList[det.meshIdx];
               const keyIdx = [33, 263, 1, 61, 291];
               const pts = [];
-              for (const ii of keyIdx) { const p = lm[ii]; if (p) pts.push([p.x * VIDEO_W, p.y * VIDEO_H]); }
-              drawPoints(ctx, pts, 'red', 2);
+              for (const ii of keyIdx) { const p = lm[ii]; if (p) pts.push([p.x * mainOverlay.width, p.y * mainOverlay.height]); }
+              drawPoints(mainCtx, pts, 'red', 3);
             }
+
+            // label background rectangle + text (high contrast)
             let label = 'unknown';
             if (a && a.id) {
               const human = idToName[a.id] || a.id;
               label = (a.score !== null && a.score !== undefined) ? `${human} ${a.score.toFixed(2)}` : human;
             }
-            ctx.fillStyle = 'yellow'; ctx.font = '16px Arial'; ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y - 6));
-            if (a && a.id) {
-              ctx.fillStyle = 'rgba(0,0,0,0.5)'; const wbox = 70, hbox = 20;
-              ctx.fillRect(det.bbox.x + det.bbox.w - wbox, det.bbox.y + det.bbox.h - hbox, wbox, hbox);
-              ctx.fillStyle = 'white'; ctx.fillText(a.id, det.bbox.x + det.bbox.w - wbox + 6, det.bbox.y + det.bbox.h - 6);
+            const x = det.bbox.x * mainOverlay.width / VIDEO_W;
+            const y = Math.max(20, det.bbox.y * mainOverlay.height / VIDEO_H - 6);
+            mainCtx.font = '18px Arial';
+            mainCtx.textBaseline = 'bottom';
+            const textWidth = mainCtx.measureText(label).width;
+            const pad = 8;
+            const rectW = Math.max(64, textWidth + pad * 2);
+            const rectH = 28;
+            mainCtx.fillStyle = 'rgba(0,0,0,0.75)';
+            mainCtx.fillRect(x, y - rectH, rectW, rectH);
+            mainCtx.fillStyle = 'white';
+            mainCtx.fillText(label, x + pad, y - 8);
+          }
+
+          if (debugMode) {
+            const firstAligned = detections.find(d => d.alignedCanvas);
+            if (firstAligned && firstAligned.alignedCanvas) {
+              const ctxA = alignedThumb.getContext('2d');
+              ctxA.clearRect(0, 0, EMBED_W, EMBED_H);
+              ctxA.drawImage(firstAligned.alignedCanvas, 0, 0, EMBED_W, EMBED_H);
             }
+            log(`[frame ${frameCounter}] dets=${detections.length} tracks=${Object.keys(tracker.tracks).length}`);
           }
-
-          const firstAligned = detections.find(d => d.alignedCanvas);
-          if (firstAligned && firstAligned.alignedCanvas) {
-            alignedThumbCtx.clearRect(0, 0, EMBED_W, EMBED_H);
-            alignedThumbCtx.drawImage(firstAligned.alignedCanvas, 0, 0, EMBED_W, EMBED_H);
-          }
-
         } catch (err) {
           console.error('mesh.onResults error:', err);
+          if (debugMode) log('mesh.onResults error: ' + String(err));
         }
       });
 
-      // camera frame handler: run detector then mesh
+      // camera onFrame: run detector then mesh
       const cameraOnFrame = async () => {
         try {
-          await faceDetector.send({ image: video });
-          await faceMesh.send({ image: video });
+          await faceDetector.send({ image: mainVideo });
+          await faceMesh.send({ image: mainVideo });
         } catch (e) {
           console.error('camera onFrame error', e);
+          if (debugMode) log('camera onFrame error: ' + String(e));
         }
       };
 
-      // start the camera
-      camera = new Camera(video, { onFrame: cameraOnFrame, width: VIDEO_W, height: VIDEO_H });
+      // start camera
+      const camera = new Camera(mainVideo, { onFrame: cameraOnFrame, width: VIDEO_W, height: VIDEO_H });
       await camera.start();
+      status.textContent = 'Camera started — Ready';
 
-      // tracker after camera start
-      tracker = new EmbeddingTracker(TRACKER_PARAMS);
+      // attach rawVideo to same stream so debug raw shows camera
+      try { rawVideo.srcObject = mainVideo.srcObject; await rawVideo.play().catch(() => { }); } catch (e) { }
+
+      resizeOverlayToMain();
+
       tracker.loadGallery();
-      try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName') || '{}')); } catch (e) { }
+      try { idToName = JSON.parse(localStorage.getItem(NAME_KEY) || '{}'); } catch (e) { idToName = {}; }
 
-      // enroll / clear handlers
-      document.getElementById('enrollBtn').onclick = () => {
-        const active = tracker.getActiveTracks();
-        if (active.length === 0) { alert('No active face to enroll'); return; }
-        active.sort((a, b) => (b.bbox.w * b.bbox.h) - (a.bbox.w * a.bbox.h));
-        const t = active[0];
-        const name = prompt('Enter name (leave blank to use track id):');
-        const label = (name && name.trim().length > 0) ? name.trim() : t.id;
-        idToName[t.id] = label;
-        try { localStorage.setItem('idToName', JSON.stringify(idToName)); tracker.saveGallery(); } catch (e) { console.warn('save failed', e); }
-      };
+      // UI wiring
+      simThresholdInput.addEventListener('input', () => { simThresholdValue.textContent = parseFloat(simThresholdInput.value).toFixed(2); });
+      simThresholdValue.textContent = parseFloat(simThresholdInput.value).toFixed(2);
 
-      document.getElementById('clearGalleryBtn').onclick = () => {
-        if (confirm('Clear saved gallery and labels (localStorage)?')) {
-          localStorage.removeItem('face_gallery_v1'); localStorage.removeItem('idToName');
-          tracker = new EmbeddingTracker(TRACKER_PARAMS);
-          for (const k in idToName) delete idToName[k];
+      // ---------- Enroll flow (OPEN modal -> confirm -> save) ----------
+      function showToast(msg, duration = 2500) {
+        const t = document.getElementById('toast');
+        t.textContent = msg;
+        t.style.display = 'block';
+        setTimeout(() => { t.style.opacity = '1'; }, 20);
+        setTimeout(() => { t.style.opacity = '0'; setTimeout(() => { t.style.display = 'none'; }, 300); }, duration);
+      }
+
+      enrollBtn.addEventListener('click', () => {
+        // protect from double clicks while processing
+        if (enrollBtn.disabled) return;
+
+        // must have last frame detections/assignments
+        if (!_lastFrameDetections || !_lastFrameAssignments || _lastFrameDetections.length === 0) {
+          alert('No visible face to enroll. Make sure a face is visible and try again.');
+          return;
         }
-      };
 
-      window.addEventListener('beforeunload', () => {
-        try { tracker.saveGallery(); localStorage.setItem('idToName', JSON.stringify(idToName)); } catch (e) { }
+        // pick largest visible detection on last frame
+        let bestIdx = -1, bestArea = -1;
+        for (let i = 0; i < _lastFrameDetections.length; i++) {
+          const d = _lastFrameDetections[i];
+          if (!d || !d.bbox) continue;
+          const area = d.bbox.w * d.bbox.h;
+          if (area > bestArea) { bestArea = area; bestIdx = i; }
+        }
+        if (bestIdx === -1) {
+          alert('No valid detection to enroll.');
+          return;
+        }
+
+        const assignment = _lastFrameAssignments[bestIdx];
+        if (!assignment || !assignment.id) {
+          alert('Could not determine track ID for selected face. Try moving slightly and try again.');
+          return;
+        }
+        const chosenId = assignment.id;
+        const chosenScore = (assignment.score !== null && assignment.score !== undefined) ? assignment.score.toFixed(3) : '';
+
+        // show modal with preview
+        enrollBtn.disabled = true;
+        enrollTrackIdEl.textContent = chosenId;
+        enrollScoreEl.textContent = chosenScore ? `score ${chosenScore}` : '';
+        const previewCtx = enrollPreviewCanvas.getContext('2d');
+        previewCtx.clearRect(0, 0, enrollPreviewCanvas.width, enrollPreviewCanvas.height);
+        const det = _lastFrameDetections[bestIdx];
+        if (det && det.alignedCanvas) {
+          previewCtx.drawImage(det.alignedCanvas, 0, 0, enrollPreviewCanvas.width, enrollPreviewCanvas.height);
+        } else {
+          // fallback: draw crop region from main video
+          previewCtx.fillStyle = 'black';
+          previewCtx.fillRect(0, 0, enrollPreviewCanvas.width, enrollPreviewCanvas.height);
+        }
+        // prefer existing name as default
+        enrollNameInput.value = idToName[chosenId] ? idToName[chosenId] : '';
+        enrollModal.style.display = 'flex';
+        enrollNameInput.focus();
+        // store chosen id on modal for confirm handler
+        enrollModal.dataset.chosenId = chosenId;
+        enrollModal.dataset.chosenIdx = bestIdx;
       });
 
-      status.textContent = 'Ready';
+      enrollCancelBtn.addEventListener('click', () => {
+        enrollModal.style.display = 'none';
+        enrollBtn.disabled = false;
+      });
+
+      enrollConfirmBtn.addEventListener('click', () => {
+        const chosenId = enrollModal.dataset.chosenId;
+        if (!chosenId) {
+          alert('Internal error: no chosen id.');
+          enrollModal.style.display = 'none';
+          enrollBtn.disabled = false;
+          return;
+        }
+        const name = enrollNameInput.value && enrollNameInput.value.trim().length > 0 ? enrollNameInput.value.trim() : chosenId;
+        idToName[chosenId] = name;
+        try {
+          localStorage.setItem(NAME_KEY, JSON.stringify(idToName));
+          tracker.saveGallery();
+        } catch (e) { console.warn('persist fail', e); }
+        enrollModal.style.display = 'none';
+        enrollBtn.disabled = false;
+        showToast(`Enrolled ${name} (${chosenId})`);
+      });
+
+      // ---------- Clear / Export / Import ----------
+      document.getElementById('clearGalleryBtn').onclick = () => {
+        if (confirm('Clear saved gallery and labels (localStorage)?')) {
+          localStorage.removeItem(GALLERY_KEY); localStorage.removeItem(NAME_KEY);
+          tracker.tracks = {}; tracker.activeTrackIds.clear(); tracker.nextId = 1;
+          idToName = {};
+          log('Gallery cleared');
+          showToast('Gallery cleared');
+        }
+      };
+
+      exportBtn.addEventListener('click', () => {
+        try {
+          const saved = localStorage.getItem(GALLERY_KEY);
+          const gallery = saved ? JSON.parse(saved) : [];
+          const names = JSON.parse(localStorage.getItem(NAME_KEY) || '{}');
+          const payload = { exportedAt: new Date().toISOString(), gallery, names, meta: { app: 'face-demo', version: 1 } };
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a'); a.href = url; a.download = `face_gallery_${(new Date()).toISOString().replace(/[:.]/g, '-')}.json`; document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+          showToast('Gallery exported');
+        } catch (e) {
+          console.error('Export failed', e);
+          alert('Export failed: ' + e.message);
+        }
+      });
+
+      importBtn.addEventListener('click', () => importFileInput.click());
+      importFileInput.addEventListener('change', async (evt) => {
+        const f = evt.target.files && evt.target.files[0];
+        if (!f) return;
+        try {
+          const text = await f.text();
+          const parsed = JSON.parse(text);
+          if (!parsed || !Array.isArray(parsed.gallery)) throw new Error('Invalid gallery file format');
+          if (!confirm('Import will replace the current saved gallery and names. Continue?')) return;
+          localStorage.setItem(GALLERY_KEY, JSON.stringify(parsed.gallery));
+          localStorage.setItem(NAME_KEY, JSON.stringify(parsed.names || {}));
+          try { tracker.loadGallery(); idToName = JSON.parse(localStorage.getItem(NAME_KEY) || '{}'); alert('Import successful.'); } catch (e) { console.warn('reload failed', e); alert('Import saved but reload failed in-memory. Refresh page.'); }
+        } catch (e) {
+          console.error('Import failed', e);
+          alert('Import failed: ' + e.message);
+        } finally {
+          importFileInput.value = '';
+        }
+      });
+
+      window.addEventListener('beforeunload', () => {
+        try { tracker.saveGallery(); localStorage.setItem(NAME_KEY, JSON.stringify(idToName)); } catch (e) { }
+      });
+
+      console.info('Ready. Use the Help button to re-open the walkthrough at any time.');
     })();
   </script>
 </body>
