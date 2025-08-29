@@ -1,43 +1,88 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
-  <title>Face demo — MediaPipe + ONNX + Embedding Tracker</title>
+  <title>Face Demo — Detector+Mesh + ONNX + Tracker</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: Arial, sans-serif; margin: 8px; }
-    #row { display:flex; gap:12px; align-items:flex-start; }
-    #videoWrap { position:relative; }
-    video, canvas { width: 640px; height: 480px; border: 1px solid #333; background:#000; }
-    #controls { margin-top:8px; }
-    button { padding:8px 12px; margin-right:8px; }
-    #log { white-space:pre-wrap; font-size:12px; margin-top:8px; max-height:220px; overflow:auto; border:1px solid #ddd; padding:8px; background:#fafafa; }
-    .small { width:112px; height:112px; border:1px solid #666; display:block; margin-top:6px; }
+    body {
+      font-family: Arial, sans-serif;
+      margin: 8px;
+    }
+
+    #row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    #videoWrap {
+      position: relative;
+    }
+
+    video,
+    canvas {
+      width: 640px;
+      height: 480px;
+      border: 1px solid #333;
+      background: #000;
+    }
+
+    #controls {
+      margin-top: 8px;
+    }
+
+    button {
+      padding: 8px 12px;
+      margin-right: 8px;
+    }
+
+    .small {
+      width: 112px;
+      height: 112px;
+      border: 1px solid #666;
+      display: block;
+      margin-top: 6px;
+    }
+
+    label {
+      font-size: 13px;
+    }
   </style>
 </head>
+
 <body>
-  <h2>Face demo — MediaPipe + ONNX + Embedding-based Tracking</h2>
+  <h2>Face Demo — Detector bbox crop → resize → 5-pt Umeyama align → ONNX embeddings → Tracker</h2>
+
   <div id="row">
     <div id="videoWrap">
       <video id="video" autoplay muted playsinline></video>
       <canvas id="overlay"></canvas>
     </div>
+
     <div id="controlsWrap">
-      <canvas id="alignedThumb" class="small"></canvas>
+      <canvas id="alignedThumb" class="small" title="Aligned 112x112 preview"></canvas>
       <div id="controls">
-        <button id="enrollBtn">Enroll (name current largest face)</button>
-        <button id="clearGalleryBtn">Clear Saved Gallery</button>
-        <label>Process every N frames:
-          <input id="procEvery" type="number" min="1" max="10" value="2" style="width:48px">
-        </label>
+        <button id="enrollBtn">Enroll (name largest face)</button>
+        <button id="clearGalleryBtn">Clear gallery</button>
+        <div style="margin-top:8px;">
+          <label>Process every N frames:
+            <input id="procEvery" type="number" min="1" max="10" value="2" style="width:48px">
+          </label>
+        </div>
+        <div style="margin-top:8px;">
+          <label>Accept scale for det→mesh match:
+            <input id="acceptScale" type="number" step="0.1" min="0.1" value="1.8" style="width:64px">
+          </label>
+        </div>
       </div>
-      <div id="status">Loading models...</div>
+      <div id="status" style="margin-top:8px">Loading models...</div>
     </div>
   </div>
 
-  <div id="log"></div>
-
-  <!-- MediaPipe Face Mesh -->
+  <!-- MediaPipe Face Detection + Face Mesh + Camera Utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
 
@@ -45,489 +90,438 @@
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 
   <script>
-  (async () => {
-    // -------- CONFIG
-    const VIDEO_W = 640, VIDEO_H = 480;
-    const EMBED_W = 112, EMBED_H = 112;
-    const MODEL_PATH = './model.onnx'; // place your ONNX here
-    const CANONICAL_5 = [   // canonical 5-point (ArcFace style, 112x112)
-      [30.2946, 51.6963],
-      [65.5318, 51.5014],
-      [48.0252, 71.7366],
-      [33.5493, 92.3655],
-      [62.7299, 92.2041]
-    ];
-    // Tracker & runtime tuning (tweak if necessary)
-    const TRACKER_PARAMS = {
-      matchThreshold: 0.62,
-      galleryThreshold: 0.58,
-      iouThreshold: 0.45,
-      maxAgeFrames: 300,   // keep tracks for longer (tweak)
-      embBufferSize: 6,
-      minEmbForNewTrack: true
-    };
-    const PAD_FACTOR = 1.9; // include chin/forehead (tweak 1.6..2.2)
-    // -------- end CONFIG
-
-    const logEl = document.getElementById('log');
-    function log(...s){ logEl.textContent += s.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
-
-    // DOM
-    const video = document.getElementById('video');
-    const overlay = document.getElementById('overlay');
-    overlay.width = VIDEO_W; overlay.height = VIDEO_H;
-    const ctx = overlay.getContext('2d');
-    const alignedThumb = document.getElementById('alignedThumb');
-    alignedThumb.width = EMBED_W; alignedThumb.height = EMBED_H;
-    const alignedThumbCtx = alignedThumb.getContext('2d');
-    const status = document.getElementById('status');
-    const procEveryInput = document.getElementById('procEvery');
-
-    // make these available early to avoid TDZ
-    let session = null;
-    let tracker = null;
-    let frameCounter = 0;
-    let faceMesh = null;
-    let camera = null;
-    const idToName = {}; // user-provided labels for track IDs (persistable)
-
-    // ---------- small utility functions ----------
-    function drawPoints(ctx, pts, color='lime', size=2){
-      ctx.fillStyle = color;
-      for(const p of pts){ ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI*2); ctx.fill(); }
-    }
-
-    function imageDataToTensor(imgData){
-      // imgData: ImageData from canvas RGBA
-      const {data, width, height} = imgData; // width,height are EMBED_W/EMBED_H
-      // convert to normalized NCHW float32 [-1,1]
-      const chw = new Float32Array(3*width*height);
-      const plane = width*height;
-      // Note: data is RGBA; we take R,G,B in that order
-      for(let y=0;y<height;y++){
-        for(let x=0;x<width;x++){
-          const i = (y*width + x)*4;
-          const r = data[i], g = data[i+1], b = data[i+2];
-          const pix = y*width + x;
-          chw[pix] = r/127.5 - 1.0;             // R
-          chw[plane + pix] = g/127.5 - 1.0;     // G
-          chw[2*plane + pix] = b/127.5 - 1.0;   // B
-        }
-      }
-      return new ort.Tensor('float32', chw, [1,3,height,width]);
-    }
-
-    // ---------- Umeyama (similarity transform) - small 2x2 SVD version ----------
-    function umeyama(srcPts, dstPts){
-      // srcPts, dstPts: arrays of [x,y], length N>=2
-      const N = srcPts.length;
-      if(N < 2) throw 'Need >=2 points for umeyama';
-      const muX = [0,0], muY = [0,0];
-      for(let i=0;i<N;i++){ muX[0]+=srcPts[i][0]; muX[1]+=srcPts[i][1]; muY[0]+=dstPts[i][0]; muY[1]+=dstPts[i][1]; }
-      muX[0]/=N; muX[1]/=N; muY[0]/=N; muY[1]/=N;
-      const Xc = srcPts.map(p => [p[0]-muX[0], p[1]-muX[1]]);
-      const Yc = dstPts.map(p => [p[0]-muY[0], p[1]-muY[1]]);
-      let cov = [[0,0],[0,0]];
-      for(let i=0;i<N;i++){
-        cov[0][0] += Yc[i][0]*Xc[i][0];
-        cov[0][1] += Yc[i][0]*Xc[i][1];
-        cov[1][0] += Yc[i][1]*Xc[i][0];
-        cov[1][1] += Yc[i][1]*Xc[i][1];
-      }
-      cov[0][0]/=N; cov[0][1]/=N; cov[1][0]/=N; cov[1][1]/=N;
-      // ATA for SVD via eigen on 2x2
-      const ATA = [
-        [cov[0][0]*cov[0][0] + cov[1][0]*cov[1][0], cov[0][0]*cov[0][1] + cov[1][0]*cov[1][1]],
-        [cov[0][1]*cov[0][0] + cov[1][1]*cov[1][0], cov[0][1]*cov[0][1] + cov[1][1]*cov[1][1]]
+    (async () => {
+      // ---------- CONFIG ----------
+      const VIDEO_W = 640, VIDEO_H = 480;
+      const EMBED_W = 112, EMBED_H = 112;
+      const MODEL_PATH = './model.onnx';
+      const CANONICAL_5 = [
+        [30.2946, 51.6963],
+        [65.5318, 51.5014],
+        [48.0252, 71.7366],
+        [33.5493, 92.3655],
+        [62.7299, 92.2041]
       ];
-      const trace = ATA[0][0] + ATA[1][1];
-      const det = ATA[0][0]*ATA[1][1] - ATA[0][1]*ATA[1][0];
-      const tmp = Math.sqrt(Math.max(0, trace*trace/4 - det));
-      const lambda1 = trace/2 + tmp, lambda2 = trace/2 - tmp;
-      const s1 = Math.sqrt(Math.max(0, lambda1)), s2 = Math.sqrt(Math.max(0, lambda2));
-      function eigv(A, lam){
-        const a=A[0][0]-lam, b=A[0][1];
-        if(Math.abs(a)+Math.abs(b) < 1e-8) return [1,0];
-        return [-b, a];
-      }
-      const v1 = eigv(ATA, lambda1);
-      const v1n = Math.hypot(v1[0], v1[1]) || 1;
-      // build V (orthonormal approx)
-      const V = [[v1[0]/v1n, -v1[1]/v1n],[v1[1]/v1n, v1[0]/v1n]];
-      // U from cov*V col normalized
-      let U = [[1,0],[0,1]];
-      if(s1 > 1e-8){
-        const col0 = [cov[0][0]*V[0][0] + cov[0][1]*V[1][0], cov[1][0]*V[0][0] + cov[1][1]*V[1][0]];
-        const n0 = Math.hypot(col0[0], col0[1]) || 1;
-        U[0][0] = col0[0]/n0; U[1][0] = col0[1]/n0;
-        U[0][1] = -U[1][0]; U[1][1] = U[0][0];
-      }
-      const detU = U[0][0]*U[1][1] - U[0][1]*U[1][0];
-      const detV = V[0][0]*V[1][1] - V[0][1]*V[1][0];
-      const Sdiag = [1,1]; if(detU * detV < 0) Sdiag[1] = -1;
-      // R = U * diag(S) * V^T
-      const Vt = [[V[0][0], V[1][0]],[V[0][1], V[1][1]]];
-      const US = [[U[0][0]*Sdiag[0], U[0][1]*Sdiag[1]],[U[1][0]*Sdiag[0], U[1][1]*Sdiag[1]]];
-      const R = [
-        [ US[0][0]*Vt[0][0] + US[0][1]*Vt[1][0], US[0][0]*Vt[0][1] + US[0][1]*Vt[1][1] ],
-        [ US[1][0]*Vt[0][0] + US[1][1]*Vt[1][0], US[1][0]*Vt[0][1] + US[1][1]*Vt[1][1] ]
-      ];
-      const sigma = [s1, s2];
-      const traceSD = sigma[0]*Sdiag[0] + sigma[1]*Sdiag[1];
-      let var_src = 0; for(let i=0;i<N;i++) var_src += Xc[i][0]*Xc[i][0] + Xc[i][1]*Xc[i][1];
-      var_src /= N;
-      const scale = (var_src < 1e-12) ? 1.0 : (traceSD / var_src);
-      // t = muY - scale * R * muX
-      const RmuX = [ R[0][0]*muX[0] + R[0][1]*muX[1], R[1][0]*muX[0] + R[1][1]*muX[1] ];
-      const t = [ muY[0] - scale * RmuX[0], muY[1] - scale * RmuX[1] ];
-      return [
-        [scale*R[0][0], scale*R[0][1], t[0]],
-        [scale*R[1][0], scale*R[1][1], t[1]],
-        [0,0,1]
-      ];
-    }
+      const TRACKER_PARAMS = { matchThreshold: 0.62, galleryThreshold: 0.58, iouThreshold: 0.45, maxAgeFrames: 300, embBufferSize: 6, minEmbForNewTrack: true };
+      // ---------- END CONFIG ----------
 
-    // ---------- EmbeddingTracker class (as provided)
-    class EmbeddingTracker {
-      constructor(opts = {}) {
-        this.matchThreshold = opts.matchThreshold ?? 0.62;
-        this.galleryThreshold = opts.galleryThreshold ?? 0.58;
-        this.iouThreshold = opts.iouThreshold ?? 0.45;
-        this.maxAgeFrames = opts.maxAgeFrames ?? 150;
-        this.embBufferSize = opts.embBufferSize ?? 8;
-        this.minEmbForNewTrack = opts.minEmbForNewTrack ?? true;
-        this.nextId = 1;
-        this.tracks = {};
-        this.activeTrackIds = new Set();
-      }
-      _newId(){ const id = `P${this.nextId++}`; return id; }
-      static cosine(a,b){
-        if(!a||!b||a.length!==b.length) return -1.0;
-        let dot=0, na=0, nb=0;
-        for(let i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }
-        return dot / (Math.sqrt(na)*Math.sqrt(nb) + 1e-10);
-      }
-      static iou(b1,b2){
-        const x1 = Math.max(b1.x,b2.x), y1 = Math.max(b1.y,b2.y);
-        const x2 = Math.min(b1.x+b1.w, b2.x+b2.w), y2 = Math.min(b1.y+b1.h, b2.y+b2.h);
-        const iw = Math.max(0, x2-x1), ih = Math.max(0, y2-y1);
-        const inter = iw*ih; const area1 = b1.w*b1.h, area2 = b2.w*b2.h;
-        const union = area1 + area2 - inter;
-        return union<=0 ? 0 : inter/union;
-      }
-      _computeMean(track){
-        if(!track.embBuffer || track.embBuffer.length===0) return null;
-        const K = track.embBuffer.length, D = track.embBuffer[0].length;
-        const mean = new Float32Array(D);
-        for(let i=0;i<K;i++){
-          const e = track.embBuffer[i];
-          for(let d=0; d<D; d++) mean[d] += e[d];
-        }
-        for(let d=0; d<D; d++) mean[d] /= K;
-        let norm = 0; for(let d=0; d<D; d++) norm += mean[d]*mean[d]; norm = Math.sqrt(norm)+1e-10;
-        for(let d=0; d<D; d++) mean[d] /= norm;
-        track.embMean = mean; return mean;
-      }
-      _pushEmb(track, emb){
-        if(!emb) return;
-        const e = (emb instanceof Float32Array) ? emb.slice(0) : new Float32Array(emb);
-        if(!track.embBuffer) track.embBuffer = [];
-        track.embBuffer.push(e);
-        if(track.embBuffer.length > this.embBufferSize) track.embBuffer.shift();
-        this._computeMean(track);
-      }
-      _createTrack(det, frameIdx){
-        const id = this._newId();
-        const now = Date.now();
-        const track = { id, embBuffer: [], embMean: null, lastSeenFrame: frameIdx, bbox: det.bbox, active: true, createdAt: now };
-        if(det.emb) this._pushEmb(track, det.emb);
-        this.tracks[id] = track;
-        this.activeTrackIds.add(id);
-        return track;
-      }
-      _updateTrack(track, det, frameIdx){
-        track.lastSeenFrame = frameIdx;
-        track.bbox = det.bbox;
-        if(det.emb) this._pushEmb(track, det.emb);
-        track.active = true;
-        this.activeTrackIds.add(track.id);
-        return track;
-      }
-      prune(frameIdx){
-        for(const id in this.tracks){
-          const t = this.tracks[id];
-          if(frameIdx - t.lastSeenFrame > this.maxAgeFrames){
-            t.active = false;
-            this.activeTrackIds.delete(id);
-          }
-        }
-      }
-      getActiveTracks(){ return Array.from(this.activeTrackIds).map(id => this.tracks[id]); }
-      updateOne(det, frameIdx = 0){
-        if(det.emb){
-          let best = { id: null, score: -2 };
-          for(const id of this.activeTrackIds){
-            const t = this.tracks[id];
-            if(!t.embMean) continue;
-            const s = EmbeddingTracker.cosine(det.emb, t.embMean);
-            if(s > best.score) best = { id, score: s };
-          }
-          if(best.id && best.score >= this.matchThreshold){
-            const track = this.tracks[best.id];
-            this._updateTrack(track, det, frameIdx);
-            return { id: track.id, score: best.score, matchedBy: 'emb' };
-          }
-          let bestGal = { id: null, score: -2 };
-          for(const id in this.tracks){
-            const t = this.tracks[id];
-            if(!t.embMean) continue;
-            const s = EmbeddingTracker.cosine(det.emb, t.embMean);
-            if(s > bestGal.score) bestGal = { id, score: s };
-          }
-          if(bestGal.id && bestGal.score >= this.galleryThreshold){
-            const track = this.tracks[bestGal.id];
-            this._updateTrack(track, det, frameIdx);
-            return { id: track.id, score: bestGal.score, matchedBy: 'gallery' };
-          }
-        }
-        let bestIou = { id: null, score: 0 };
-        for(const id of this.activeTrackIds){
-          const t = this.tracks[id];
-          const s = EmbeddingTracker.iou(t.bbox, det.bbox);
-          if(s > bestIou.score) bestIou = { id, score: s };
-        }
-        if(bestIou.id && bestIou.score >= this.iouThreshold){
-          const track = this.tracks[bestIou.id];
-          this._updateTrack(track, det, frameIdx);
-          return { id: track.id, score: bestIou.score, matchedBy: 'iou' };
-        }
-        if(det.emb || !this.minEmbForNewTrack){
-          const newTrack = this._createTrack(det, frameIdx);
-          return { id: newTrack.id, score: null, matchedBy: 'new' };
-        }
-        return { id: null, score: null, matchedBy: 'none' };
-      }
-      updateBatch(detections, frameIdx = 0){
-        const assignments = [];
-        const idxs = detections.map((_,i)=>i).sort((a,b) => (detections[b].emb?1:0) - (detections[a].emb?1:0));
-        for(const i of idxs){ const det = detections[i]; const res = this.updateOne(det, frameIdx); assignments[i] = res; }
-        this.prune(frameIdx);
-        return assignments;
-      }
-      saveGallery(key='face_gallery_v1'){
-        const dump = [];
-        for(const id in this.tracks){
-          const t = this.tracks[id];
-          if(t.embMean) dump.push({ id: t.id, emb: Array.from(t.embMean), lastSeen: t.lastSeenFrame, createdAt: t.createdAt });
-        }
-        localStorage.setItem(key, JSON.stringify(dump));
-      }
-      loadGallery(key='face_gallery_v1'){
-        const raw = localStorage.getItem(key); if(!raw) return;
-        try {
-          const dump = JSON.parse(raw);
-          for(const e of dump){
-            const t = { id: e.id, embBuffer: [ new Float32Array(e.emb) ], embMean: new Float32Array(e.emb), lastSeenFrame: e.lastSeen ?? 0, bbox: { x:0,y:0,w:0,h:0 }, active: false, createdAt: e.createdAt ?? Date.now() };
-            this.tracks[t.id] = t;
-          }
-          const maxId = Object.keys(this.tracks).reduce((m,id)=>Math.max(m, parseInt(id.replace('P',''))), 0);
-          if(maxId >= this.nextId) this.nextId = maxId + 1;
-        } catch(e){ console.warn('loadGallery failed', e); }
-      }
-    }
+      // DOM elements
+      const video = document.getElementById('video');
+      const overlay = document.getElementById('overlay');
+      overlay.width = VIDEO_W; overlay.height = VIDEO_H;
+      const ctx = overlay.getContext('2d');
+      const alignedThumb = document.getElementById('alignedThumb');
+      alignedThumb.width = EMBED_W; alignedThumb.height = EMBED_H;
+      const alignedThumbCtx = alignedThumb.getContext('2d');
+      const status = document.getElementById('status');
+      const procEveryInput = document.getElementById('procEvery');
+      const acceptScaleInput = document.getElementById('acceptScale');
 
-    // ---------- load ONNX model (try webgl first) ----------
-    status.textContent = 'Loading ONNX model...';
-    log('Loading ONNX model from', MODEL_PATH);
-    try {
-      session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl','wasm'] });
-      log('ONNX session created (webgl preferred if available).');
-    } catch(e){
-      log('ONNX webgl failed or unavailable, fallback to default:', e);
-      session = await ort.InferenceSession.create(MODEL_PATH);
-      log('ONNX session created (fallback).');
-    }
-    status.textContent = 'Model ready';
-    // small helper to get input/output names
-    const inputName = session.inputNames ? session.inputNames[0] : session._inputs[0].name;
-    const outputName = session.outputNames ? session.outputNames[0] : session._outputs[0].name;
+      // state
+      let session = null;
+      let tracker = null;
+      let frameCounter = 0;
+      let faceDetector = null;
+      let faceMesh = null;
+      let camera = null;
+      let latestDetections = null;
+      const idToName = {};
 
-    // ---------- instantiate tracker and load saved gallery ----------
-    tracker = new EmbeddingTracker(TRACKER_PARAMS);
-    tracker.loadGallery(); // optional (loads from localStorage if exists)
-    // also restore idToName mapping if exist
-    try { const n = JSON.parse(localStorage.getItem('idToName')||'{}'); Object.assign(idToName, n); } catch(e){}
+      // small helpers
+      function drawPoints(ctx, pts, color = 'lime', size = 2) {
+        ctx.fillStyle = color;
+        for (const p of pts) { if (!p || !isFinite(p[0]) || !isFinite(p[1])) continue; ctx.beginPath(); ctx.arc(p[0], p[1], size, 0, Math.PI * 2); ctx.fill(); }
+      }
 
-    // ---------- MediaPipe setup ----------
-    faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
-    faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      function imageDataToTensor(imgData) {
+        const { data, width, height } = imgData;
+        const plane = width * height;
+        const buf = new Float32Array(3 * plane);
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            const pix = y * width + x;
+            buf[pix] = r / 127.5 - 1.0;
+            buf[plane + pix] = g / 127.5 - 1.0;
+            buf[2 * plane + pix] = b / 127.5 - 1.0;
+          }
+        }
+        return new ort.Tensor('float32', buf, [1, 3, height, width]);
+      }
 
-    // ---------- onResults definition (uses session & tracker) ----------
-    async function onResults(results){
+      // Umeyama for 2D (kept identical)
+      function umeyama(srcPts, dstPts) {
+        const N = srcPts.length;
+        if (N < 2) throw new Error('umeyama requires >=2 points');
+        const mu_src = [0, 0], mu_dst = [0, 0];
+        for (let i = 0; i < N; i++) { mu_src[0] += srcPts[i][0]; mu_src[1] += srcPts[i][1]; mu_dst[0] += dstPts[i][0]; mu_dst[1] += dstPts[i][1]; }
+        mu_src[0] /= N; mu_src[1] /= N; mu_dst[0] /= N; mu_dst[1] /= N;
+        const Xc = new Array(N), Yc = new Array(N);
+        for (let i = 0; i < N; i++) { Xc[i] = [srcPts[i][0] - mu_src[0], srcPts[i][1] - mu_src[1]]; Yc[i] = [dstPts[i][0] - mu_dst[0], dstPts[i][1] - mu_dst[1]]; }
+        const cov = [[0, 0], [0, 0]];
+        for (let i = 0; i < N; i++) {
+          cov[0][0] += Yc[i][0] * Xc[i][0]; cov[0][1] += Yc[i][0] * Xc[i][1];
+          cov[1][0] += Yc[i][1] * Xc[i][0]; cov[1][1] += Yc[i][1] * Xc[i][1];
+        }
+        cov[0][0] /= N; cov[0][1] /= N; cov[1][0] /= N; cov[1][1] /= N;
+        const ATA = [
+          [cov[0][0] * cov[0][0] + cov[1][0] * cov[1][0], cov[0][0] * cov[0][1] + cov[1][0] * cov[1][1]],
+          [cov[0][1] * cov[0][0] + cov[1][1] * cov[1][0], cov[0][1] * cov[0][1] + cov[1][1] * cov[1][1]]
+        ];
+        const tr = ATA[0][0] + ATA[1][1];
+        const det = ATA[0][0] * ATA[1][1] - ATA[0][1] * ATA[1][0];
+        const disc = Math.max(0, tr * tr / 4 - det);
+        const tmp = Math.sqrt(disc);
+        const lambda1 = tr / 2 + tmp, lambda2 = tr / 2 - tmp;
+        const s1 = Math.sqrt(Math.max(0, lambda1)), s2 = Math.sqrt(Math.max(0, lambda2));
+        function eigVec(A, lam) { const a = A[0][0] - lam, b = A[0][1]; if (Math.abs(a) + Math.abs(b) < 1e-12) return [1, 0]; return [-b, a]; }
+        const v1 = eigVec(ATA, lambda1);
+        const v1n = Math.hypot(v1[0], v1[1]) || 1;
+        const V = [[v1[0] / v1n, -v1[1] / v1n], [v1[1] / v1n, v1[0] / v1n]];
+        let U = [[1, 0], [0, 1]];
+        if (s1 > 1e-12) {
+          const col0 = [cov[0][0] * V[0][0] + cov[0][1] * V[1][0], cov[1][0] * V[0][0] + cov[1][1] * V[1][0]];
+          const n0 = Math.hypot(col0[0], col0[1]) || 1;
+          U[0][0] = col0[0] / n0; U[1][0] = col0[1] / n0;
+          U[0][1] = -U[1][0]; U[1][1] = U[0][0];
+        }
+        const detU = U[0][0] * U[1][1] - U[0][1] * U[1][0];
+        const detV = V[0][0] * V[1][1] - V[0][1] * V[1][0];
+        const Sdiag = [1, 1]; if (detU * detV < 0) Sdiag[1] = -1;
+        const Vt = [[V[0][0], V[1][0]], [V[0][1], V[1][1]]];
+        const US = [[U[0][0] * Sdiag[0], U[0][1] * Sdiag[1]], [U[1][0] * Sdiag[0], U[1][1] * Sdiag[1]]];
+        const R = [
+          [US[0][0] * Vt[0][0] + US[0][1] * Vt[1][0], US[0][0] * Vt[0][1] + US[0][1] * Vt[1][1]],
+          [US[1][0] * Vt[0][0] + US[1][1] * Vt[1][0], US[1][0] * Vt[0][1] + US[1][1] * Vt[1][1]]
+        ];
+        const traceSD = s1 * Sdiag[0] + s2 * Sdiag[1];
+        let var_src = 0;
+        for (let i = 0; i < N; i++) var_src += Xc[i][0] * Xc[i][0] + Xc[i][1] * Xc[i][1];
+        var_src /= N;
+        const scale = (var_src < 1e-12) ? 1.0 : (traceSD / var_src);
+        const Rmu = [R[0][0] * mu_src[0] + R[0][1] * mu_src[1], R[1][0] * mu_src[0] + R[1][1] * mu_src[1]];
+        const t = [mu_dst[0] - scale * Rmu[0], mu_dst[1] - scale * Rmu[1]];
+        return [
+          [scale * R[0][0], scale * R[0][1], t[0]],
+          [scale * R[1][0], scale * R[1][1], t[1]],
+          [0, 0, 1]
+        ];
+      }
+
+      // EmbeddingTracker class (unchanged)
+      class EmbeddingTracker {
+        constructor(opts = {}) {
+          this.matchThreshold = opts.matchThreshold ?? 0.62;
+          this.galleryThreshold = opts.galleryThreshold ?? 0.58;
+          this.iouThreshold = opts.iouThreshold ?? 0.45;
+          this.maxAgeFrames = opts.maxAgeFrames ?? 150;
+          this.embBufferSize = opts.embBufferSize ?? 8;
+          this.minEmbForNewTrack = opts.minEmbForNewTrack ?? true;
+          this.nextId = 1;
+          this.tracks = {};
+          this.activeTrackIds = new Set();
+        }
+        _newId() { const id = `P${this.nextId++}`; return id; }
+        static cosine(a, b) { if (!a || !b || a.length !== b.length) return -1.0; let dot = 0, na = 0, nb = 0; for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-10); }
+        static iou(b1, b2) { const x1 = Math.max(b1.x, b2.x), y1 = Math.max(b1.y, b2.y); const x2 = Math.min(b1.x + b1.w, b2.x + b2.w), y2 = Math.min(b1.y + b1.h, b2.y + b2.h); const iw = Math.max(0, x2 - x1), ih = Math.max(0, y2 - y1); const inter = iw * ih; const area1 = b1.w * b1.h, area2 = b2.w * b2.h; const union = area1 + area2 - inter; return union <= 0 ? 0 : inter / union; }
+        _computeMean(track) { if (!track.embBuffer || track.embBuffer.length === 0) return null; const K = track.embBuffer.length, D = track.embBuffer[0].length; const mean = new Float32Array(D); for (let i = 0; i < K; i++) { const e = track.embBuffer[i]; for (let d = 0; d < D; d++) mean[d] += e[d]; } for (let d = 0; d < D; d++) mean[d] /= K; let norm = 0; for (let d = 0; d < D; d++) norm += mean[d] * mean[d]; norm = Math.sqrt(norm) + 1e-10; for (let d = 0; d < D; d++) mean[d] /= norm; track.embMean = mean; return mean; }
+        _pushEmb(track, emb) { if (!emb) return; const e = (emb instanceof Float32Array) ? emb.slice(0) : new Float32Array(emb); if (!track.embBuffer) track.embBuffer = []; track.embBuffer.push(e); if (track.embBuffer.length > this.embBufferSize) track.embBuffer.shift(); this._computeMean(track); }
+        _createTrack(det, frameIdx) { const id = this._newId(); const now = Date.now(); const track = { id, embBuffer: [], embMean: null, lastSeenFrame: frameIdx, bbox: det.bbox, active: true, createdAt: now }; if (det.emb) this._pushEmb(track, det.emb); this.tracks[id] = track; this.activeTrackIds.add(id); return track; }
+        _updateTrack(track, det, frameIdx) { track.lastSeenFrame = frameIdx; track.bbox = det.bbox; if (det.emb) this._pushEmb(track, det.emb); track.active = true; this.activeTrackIds.add(track.id); return track; }
+        prune(frameIdx) { for (const id in this.tracks) { const t = this.tracks[id]; if (frameIdx - t.lastSeenFrame > this.maxAgeFrames) { t.active = false; this.activeTrackIds.delete(id); } } }
+        getActiveTracks() { return Array.from(this.activeTrackIds).map(id => this.tracks[id]); }
+        updateOne(det, frameIdx = 0) {
+          if (det.emb) {
+            let best = { id: null, score: -2 };
+            for (const id of this.activeTrackIds) { const t = this.tracks[id]; if (!t.embMean) continue; const s = EmbeddingTracker.cosine(det.emb, t.embMean); if (s > best.score) best = { id, score: s }; }
+            if (best.id && best.score >= this.matchThreshold) { const track = this.tracks[best.id]; this._updateTrack(track, det, frameIdx); return { id: track.id, score: best.score, matchedBy: 'emb' }; }
+            let bestGal = { id: null, score: -2 };
+            for (const id in this.tracks) { const t = this.tracks[id]; if (!t.embMean) continue; const s = EmbeddingTracker.cosine(det.emb, t.embMean); if (s > bestGal.score) bestGal = { id, score: s }; }
+            if (bestGal.id && bestGal.score >= this.galleryThreshold) { const track = this.tracks[bestGal.id]; this._updateTrack(track, det, frameIdx); return { id: track.id, score: bestGal.score, matchedBy: 'gallery' }; }
+          }
+          let bestIou = { id: null, score: 0 };
+          for (const id of this.activeTrackIds) { const t = this.tracks[id]; const s = EmbeddingTracker.iou(t.bbox, det.bbox); if (s > bestIou.score) bestIou = { id, score: s }; }
+          if (bestIou.id && bestIou.score >= this.iouThreshold) { const track = this.tracks[bestIou.id]; this._updateTrack(track, det, frameIdx); return { id: track.id, score: bestIou.score, matchedBy: 'iou' }; }
+          if (det.emb || !this.minEmbForNewTrack) { const newTrack = this._createTrack(det, frameIdx); return { id: newTrack.id, score: null, matchedBy: 'new' }; }
+          return { id: null, score: null, matchedBy: 'none' };
+        }
+        updateBatch(detections, frameIdx = 0) { const assignments = []; const idxs = detections.map((_, i) => i).sort((a, b) => (detections[b].emb ? 1 : 0) - (detections[a].emb ? 1 : 0)); for (const i of idxs) { const det = detections[i]; assignments[i] = this.updateOne(det, frameIdx); } this.prune(frameIdx); return assignments; }
+        saveGallery(key = 'face_gallery_v1') { const dump = []; for (const id in this.tracks) { const t = this.tracks[id]; if (t.embMean) dump.push({ id: t.id, emb: Array.from(t.embMean), lastSeen: t.lastSeenFrame, createdAt: t.createdAt }); } localStorage.setItem(key, JSON.stringify(dump)); }
+        loadGallery(key = 'face_gallery_v1') { const raw = localStorage.getItem(key); if (!raw) return; try { const dump = JSON.parse(raw); for (const e of dump) { const t = { id: e.id, embBuffer: [new Float32Array(e.emb)], embMean: new Float32Array(e.emb), lastSeenFrame: e.lastSeen ?? 0, bbox: { x: 0, y: 0, w: 0, h: 0 }, active: false, createdAt: e.createdAt ?? Date.now() }; this.tracks[t.id] = t; } const maxId = Object.keys(this.tracks).reduce((m, id) => Math.max(m, parseInt(id.replace('P', ''))), 0); if (maxId >= this.nextId) this.nextId = maxId + 1; } catch (e) { console.warn('loadGallery failed', e); } }
+      } // end tracker
+
+      // ---------- load ONNX ----------
+      status.textContent = 'Loading ONNX model...';
       try {
-        frameCounter++;
-        ctx.clearRect(0,0, overlay.width, overlay.height);
-        ctx.drawImage(results.image, 0, 0, overlay.width, overlay.height);
+        session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl', 'wasm'] });
+      } catch (e) {
+        session = await ort.InferenceSession.create(MODEL_PATH);
+      }
+      status.textContent = 'Model ready';
+      const inputName = session.inputNames[0];
+      const outputName = session.outputNames[0];
 
-        if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0){
-          return;
+      // ---------- instantiate tracker & restore gallery/names ----------
+      tracker = new EmbeddingTracker(TRACKER_PARAMS);
+      tracker.loadGallery();
+      try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName') || '{}')); } catch (e) { }
+
+      // ---------- MediaPipe setup ----------
+      faceDetector = new FaceDetection({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}` });
+      faceDetector.setOptions({ model: 'short', minDetectionConfidence: 0.5 });
+      faceDetector.onResults((res) => { latestDetections = res; });
+
+      faceMesh = new FaceMesh({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+      faceMesh.setOptions({ maxNumFaces: 4, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+      // ---------- detection->pixel bbox conversion ----------
+      function detectionToBBox(detection) {
+        if (!detection) return null;
+        if (detection.boundingBox) {
+          const bb = detection.boundingBox;
+          let xmin = bb.xmin, ymin = bb.ymin, wnorm = bb.width, hnorm = bb.height;
+          if ((xmin === undefined || ymin === undefined) && (bb.xCenter !== undefined && bb.yCenter !== undefined)) {
+            xmin = bb.xCenter - (wnorm || 0) / 2.0;
+            ymin = bb.yCenter - (hnorm || 0) / 2.0;
+          }
+          if (xmin === undefined || ymin === undefined || wnorm === undefined || hnorm === undefined) return null;
+          wnorm = Math.max(0, Math.min(1, wnorm));
+          hnorm = Math.max(0, Math.min(1, hnorm));
+          xmin = Math.max(0, Math.min(1, xmin));
+          ymin = Math.max(0, Math.min(1, ymin));
+          const xpx = Math.round(xmin * VIDEO_W);
+          const ypx = Math.round(ymin * VIDEO_H);
+          let wpx = Math.round(wnorm * VIDEO_W);
+          let hpx = Math.round(hnorm * VIDEO_H);
+          if (xpx + wpx > VIDEO_W) wpx = VIDEO_W - xpx;
+          if (ypx + hpx > VIDEO_H) hpx = VIDEO_H - ypx;
+          if (wpx <= 0 || hpx <= 0) return null;
+          return { x: xpx, y: ypx, w: wpx, h: hpx };
         }
-        const facesLM = results.multiFaceLandmarks;
-        // Build detection objects
-        const detections = [];
-        for(let f=0; f<facesLM.length; f++){
-          const landmarks = facesLM[f];
-          // convert normalized to pixels
-          const pts = landmarks.map(l => [l.x * VIDEO_W, l.y * VIDEO_H]);
+        if (detection.locationData && detection.locationData.relativeBoundingBox) {
+          const rb = detection.locationData.relativeBoundingBox;
+          let xmin = rb.xmin, ymin = rb.ymin, wnorm = rb.width, hnorm = rb.height;
+          if ((xmin === undefined || ymin === undefined) && (rb.xCenter !== undefined && rb.yCenter !== undefined)) {
+            xmin = rb.xCenter - (rb.width || 0) / 2.0;
+            ymin = rb.yCenter - (rb.height || 0) / 2.0;
+            wnorm = rb.width; hnorm = rb.height;
+          }
+          if (xmin === undefined || ymin === undefined || wnorm === undefined || hnorm === undefined) return null;
+          wnorm = Math.max(0, Math.min(1, wnorm));
+          hnorm = Math.max(0, Math.min(1, hnorm));
+          xmin = Math.max(0, Math.min(1, xmin));
+          ymin = Math.max(0, Math.min(1, ymin));
+          const xpx = Math.round(xmin * VIDEO_W);
+          const ypx = Math.round(ymin * VIDEO_H);
+          let wpx = Math.round(wnorm * VIDEO_W);
+          let hpx = Math.round(hnorm * VIDEO_H);
+          if (xpx + wpx > VIDEO_W) wpx = VIDEO_W - xpx;
+          if (ypx + hpx > VIDEO_H) hpx = VIDEO_H - ypx;
+          if (wpx <= 0 || hpx <= 0) return null;
+          return { x: xpx, y: ypx, w: wpx, h: hpx };
+        }
+        return null;
+      }
 
-          // draw 5 key points for debug
-          const idxs = { leftEye:33, rightEye:263, nose:1, leftMouth:61, rightMouth:291 };
-          const key5 = [ pts[idxs.leftEye], pts[idxs.rightEye], pts[idxs.nose], pts[idxs.leftMouth], pts[idxs.rightMouth] ];
-          drawPoints(ctx, key5, 'red', 2);
+      // crop->resize->align (safe fallback)
+      function cropResizeAlignFromBox(videoEl, bbox, landmarksVideoPts, canonical5, EMBED_W = 112, EMBED_H = 112) {
+        if (!bbox) return null;
+        let x = Math.round(bbox.x), y = Math.round(bbox.y), w = Math.round(bbox.w), h = Math.round(bbox.h);
+        if (w <= 0 || h <= 0) return null;
+        if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
+        if (x + w > VIDEO_W) w = VIDEO_W - x; if (y + h > VIDEO_H) h = VIDEO_H - y;
+        if (w <= 0 || h <= 0) return null;
+        const cropCanvas = document.createElement('canvas'); cropCanvas.width = EMBED_W; cropCanvas.height = EMBED_H;
+        const cctx = cropCanvas.getContext('2d');
+        cctx.drawImage(videoEl, x, y, w, h, 0, 0, EMBED_W, EMBED_H);
+        if (!Array.isArray(landmarksVideoPts) || landmarksVideoPts.length < 5) return cropCanvas;
+        for (let i = 0; i < 5; i++) { const p = landmarksVideoPts[i]; if (!p || isNaN(p[0]) || isNaN(p[1])) return cropCanvas; }
+        const src5 = landmarksVideoPts.slice(0, 5).map(p => { const rx = (p[0] - x) / w; const ry = (p[1] - y) / h; return [rx * EMBED_W, ry * EMBED_H]; });
+        for (const s of src5) if (!isFinite(s[0]) || !isFinite(s[1])) return cropCanvas;
+        let M;
+        try { M = umeyama(src5, canonical5); } catch (e) { return cropCanvas; }
+        const aligned = document.createElement('canvas'); aligned.width = EMBED_W; aligned.height = EMBED_H;
+        const actx = aligned.getContext('2d'); actx.fillStyle = 'black'; actx.fillRect(0, 0, EMBED_W, EMBED_H);
+        const a = M[0][0], b = M[0][1], tx = M[0][2], c = M[1][0], d = M[1][1], ty = M[1][2];
+        actx.setTransform(a, c, b, d, tx, ty);
+        actx.drawImage(cropCanvas, 0, 0, EMBED_W, EMBED_H);
+        actx.setTransform(1, 0, 0, 1, 0, 0);
+        return aligned;
+      }
 
-          // bbox from all landmarks (robust)
-          let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
-          for(const p of pts){ if(p[0]<minx) minx=p[0]; if(p[1]<miny) miny=p[1]; if(p[0]>maxx) maxx=p[0]; if(p[1]>maxy) maxy=p[1]; }
-          const cx = (minx+maxx)/2, cy=(miny+maxy)/2;
-          let size = Math.max(maxx-minx, maxy-miny);
-          const MIN_SIZE = 40;
-          if(size < MIN_SIZE) size = MIN_SIZE;
-          size = size * PAD_FACTOR;
-          let x0 = Math.round(cx - size/2), y0 = Math.round(cy - size/2), w = Math.round(size), h = Math.round(size);
-          if(x0 < 0) { w += x0; x0 = 0; } if(y0 < 0) { h += y0; y0 = 0; }
-          if(x0 + w > VIDEO_W) w = VIDEO_W - x0;
-          if(y0 + h > VIDEO_H) h = VIDEO_H - y0;
-          if(w <= 0 || h <= 0) continue;
+      // ---------- FACE MESH processing ----------
+      faceMesh.onResults(async (meshResults) => {
+        try {
+          frameCounter++;
+          ctx.clearRect(0, 0, overlay.width, overlay.height);
+          ctx.drawImage(meshResults.image, 0, 0, overlay.width, overlay.height);
 
-          // draw bbox
-          ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(x0, y0, w, h);
+          if (!latestDetections || !Array.isArray(latestDetections.detections) || latestDetections.detections.length === 0) {
+            return;
+          }
 
-          // prepare temporary canvas crop
-          const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
-          const tctx = tmp.getContext('2d');
-          tctx.drawImage(video, x0, y0, w, h, 0, 0, w, h);
+          const detBboxes = [];
+          for (const det of latestDetections.detections) {
+            const bb = detectionToBBox(det);
+            detBboxes.push(bb);
+          }
 
-          // compute src5 in resized crop coords
-          const scaleX = EMBED_W / w, scaleY = EMBED_H / h;
-          const src5_resized = key5.map(p => [(p[0]-x0)*scaleX, (p[1]-y0)*scaleY]);
-
-          // compute transform and draw aligned onto temporary aligned canvas
-          const M = umeyama(src5_resized, CANONICAL_5);
-          const alignedTmp = document.createElement('canvas'); alignedTmp.width = EMBED_W; alignedTmp.height = EMBED_H;
-          const actx = alignedTmp.getContext('2d');
-          actx.save();
-          const a = M[0][0], b = M[0][1], tx = M[0][2], c = M[1][0], d = M[1][1], ty = M[1][2];
-          actx.setTransform(a, c, b, d, tx, ty);
-          actx.drawImage(tmp, 0, 0, w, h);
-          actx.restore();
-
-          // show thumbnail of last processed face (for debug)
-          alignedThumbCtx.clearRect(0,0, EMBED_W, EMBED_H);
-          alignedThumbCtx.drawImage(alignedTmp, 0, 0, EMBED_W, EMBED_H);
-
-          // build detection record
-          detections.push({
-            bbox: { x: x0, y: y0, w: w, h: h },
-            alignedCanvas: alignedTmp, // we will read ImageData later if processing embeddings
-            emb: null  // filled below if we run embedding extraction
+          const meshList = Array.isArray(meshResults.multiFaceLandmarks) ? meshResults.multiFaceLandmarks.filter(m => Array.isArray(m) && m.length > 0) : [];
+          const meshCentroids = meshList.map(landmarks => {
+            let sx = 0, sy = 0, cnt = 0;
+            for (const l of landmarks) { if (!l || l.x === undefined || l.y === undefined) continue; sx += l.x * VIDEO_W; sy += l.y * VIDEO_H; cnt++; }
+            return cnt === 0 ? null : [sx / cnt, sy / cnt];
           });
-        } // end per-face build
 
-        // decide whether we compute embeddings this frame
-        const processEvery = Math.max(1, parseInt(procEveryInput.value || '2', 10));
-        const doEmb = (frameCounter % processEvery) === 0;
-
-        // if there are detections, compute embeddings (sequentially to avoid overloading)
-        if(detections.length > 0 && doEmb){
-          for(let i=0;i<detections.length;i++){
-            try {
-              const idata = detections[i].alignedCanvas.getContext('2d').getImageData(0,0, EMBED_W, EMBED_H);
-              const tensor = imageDataToTensor(idata);
-              const feeds = {}; feeds[inputName] = tensor;
-              const out = await session.run(feeds);
-              const embArr = out[outputName].data;
-              // normalize
-              const f = new Float32Array(embArr.length);
-              let norm=0; for(let k=0;k<embArr.length;k++){ norm += embArr[k]*embArr[k]; f[k]=embArr[k]; }
-              norm = Math.sqrt(norm)+1e-10;
-              for(let k=0;k<f.length;k++) f[k] = f[k]/norm;
-              detections[i].emb = f;
-            } catch(e){
-              console.error('embedding extraction error', e);
-              detections[i].emb = null;
+          const detToMeshIdx = new Array(detBboxes.length).fill(null);
+          const ACCEPT_SCALE = Math.max(0.1, parseFloat(acceptScaleInput.value || '1.8'));
+          for (let di = 0; di < detBboxes.length; di++) {
+            const db = detBboxes[di];
+            if (!db) { detToMeshIdx[di] = null; continue; }
+            const cx = db.x + db.w / 2, cy = db.y + db.h / 2;
+            let best = { idx: null, dist: Infinity };
+            for (let mi = 0; mi < meshCentroids.length; mi++) {
+              const mc = meshCentroids[mi];
+              if (!mc) continue;
+              const dx = mc[0] - cx, dy = mc[1] - cy;
+              const dist = dx * dx + dy * dy;
+              if (dist < best.dist) { best = { idx: mi, dist }; }
+            }
+            const diag2 = db.w * db.w + db.h * db.h;
+            if (best.idx !== null && best.dist < diag2 * ACCEPT_SCALE) {
+              detToMeshIdx[di] = best.idx;
+            } else {
+              detToMeshIdx[di] = null;
             }
           }
-        }
 
-        // feed detections to tracker in batch
-        const assignments = tracker.updateBatch(detections, frameCounter);
-
-        // draw per-detection labels
-        for(let i=0;i<detections.length;i++){
-          const a = assignments[i];
-          const det = detections[i];
-          let label = 'unknown';
-          if(a && a.id){
-            // map to human label if user assigned
-            const human = idToName[a.id] || a.id;
-            if(a.score !== null && a.score !== undefined) label = `${human} ${a.score.toFixed(2)}`;
-            else label = human;
+          const detections = [];
+          for (let di = 0; di < detBboxes.length; di++) {
+            const bbox = detBboxes[di];
+            if (!bbox) continue;
+            const meshIdx = detToMeshIdx[di];
+            let fivePts = null;
+            if (meshIdx !== null && meshIdx !== undefined && meshIdx < meshList.length) {
+              const lm = meshList[meshIdx];
+              const indices = [33, 263, 1, 61, 291];
+              let ok = true;
+              for (const idx of indices) { if (!lm[idx] || lm[idx].x === undefined || lm[idx].y === undefined) { ok = false; break; } }
+              if (ok) fivePts = indices.map(i => [lm[i].x * VIDEO_W, lm[i].y * VIDEO_H]);
+              else fivePts = null;
+            }
+            const alignedCanvas = cropResizeAlignFromBox(video, bbox, fivePts, CANONICAL_5, EMBED_W, EMBED_H);
+            detections.push({ bbox, alignedCanvas, emb: null, meshIdx });
           }
-          // draw label above bbox
-          ctx.fillStyle = 'yellow'; ctx.font = '16px Arial';
-          ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y - 6));
-          // also draw ID small inside box corner
-          if(a && a.id){
-            ctx.fillStyle = 'rgba(0,0,0,0.5)';
-            ctx.fillRect(det.bbox.x + det.bbox.w - 70, det.bbox.y + det.bbox.h - 20, 70, 20);
-            ctx.fillStyle = 'white';
-            ctx.fillText(a.id, det.bbox.x + det.bbox.w - 64, det.bbox.y + det.bbox.h - 6);
+
+          const processEvery = Math.max(1, parseInt(procEveryInput.value || '2', 10));
+          const doEmb = (frameCounter % processEvery) === 0;
+
+          if (doEmb) {
+            for (let i = 0; i < detections.length; i++) {
+              const det = detections[i];
+              if (!det.alignedCanvas) continue;
+              try {
+                const idata = det.alignedCanvas.getContext('2d').getImageData(0, 0, EMBED_W, EMBED_H);
+                const tensor = imageDataToTensor(idata);
+                const feeds = {}; feeds[inputName] = tensor;
+                const out = await session.run(feeds);
+                const embArr = out[outputName].data;
+                const f = new Float32Array(embArr.length);
+                let norm = 0; for (let k = 0; k < embArr.length; k++) { norm += embArr[k] * embArr[k]; f[k] = embArr[k]; }
+                norm = Math.sqrt(norm) + 1e-10; for (let k = 0; k < f.length; k++) f[k] = f[k] / norm;
+                det.emb = f;
+              } catch (e) {
+                det.emb = null;
+                console.error('Embedding extraction error', e);
+              }
+            }
           }
+
+          const assignments = tracker.updateBatch(detections, frameCounter);
+
+          // draw boxes, landmarks, labels
+          for (let i = 0; i < detections.length; i++) {
+            const det = detections[i];
+            const a = assignments[i];
+            ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
+            if (det.meshIdx !== null && det.meshIdx !== undefined && meshList[det.meshIdx]) {
+              const lm = meshList[det.meshIdx];
+              const keyIdx = [33, 263, 1, 61, 291];
+              const pts = [];
+              for (const ii of keyIdx) { const p = lm[ii]; if (p) pts.push([p.x * VIDEO_W, p.y * VIDEO_H]); }
+              drawPoints(ctx, pts, 'red', 2);
+            }
+            let label = 'unknown';
+            if (a && a.id) {
+              const human = idToName[a.id] || a.id;
+              label = (a.score !== null && a.score !== undefined) ? `${human} ${a.score.toFixed(2)}` : human;
+            }
+            ctx.fillStyle = 'yellow'; ctx.font = '16px Arial'; ctx.fillText(label, det.bbox.x, Math.max(16, det.bbox.y - 6));
+            if (a && a.id) {
+              ctx.fillStyle = 'rgba(0,0,0,0.5)'; const wbox = 70, hbox = 20;
+              ctx.fillRect(det.bbox.x + det.bbox.w - wbox, det.bbox.y + det.bbox.h - hbox, wbox, hbox);
+              ctx.fillStyle = 'white'; ctx.fillText(a.id, det.bbox.x + det.bbox.w - wbox + 6, det.bbox.y + det.bbox.h - 6);
+            }
+          }
+
+          const firstAligned = detections.find(d => d.alignedCanvas);
+          if (firstAligned && firstAligned.alignedCanvas) {
+            alignedThumbCtx.clearRect(0, 0, EMBED_W, EMBED_H);
+            alignedThumbCtx.drawImage(firstAligned.alignedCanvas, 0, 0, EMBED_W, EMBED_H);
+          }
+
+        } catch (err) {
+          console.error('mesh.onResults error:', err);
         }
+      });
 
-      } catch (err) {
-        console.error('onResults error:', err);
-      }
-    } // end onResults
+      // camera frame handler: run detector then mesh
+      const cameraOnFrame = async () => {
+        try {
+          await faceDetector.send({ image: video });
+          await faceMesh.send({ image: video });
+        } catch (e) {
+          console.error('camera onFrame error', e);
+        }
+      };
 
-    // ---------- register onResults and start camera ----------
-    faceMesh.onResults(onResults);
-    // camera helper
-    camera = new Camera(video, { onFrame: async () => { await faceMesh.send({image: video}); }, width: VIDEO_W, height: VIDEO_H });
-    await camera.start();
-    log('Camera started. Ready.');
+      // start the camera
+      camera = new Camera(video, { onFrame: cameraOnFrame, width: VIDEO_W, height: VIDEO_H });
+      await camera.start();
 
-    // ---------- Enroll button: name largest active track ----------
-    document.getElementById('enrollBtn').onclick = () => {
-      const active = tracker.getActiveTracks();
-      if(active.length === 0){ alert('No active face to enroll'); return; }
-      // pick largest bbox area
-      active.sort((a,b) => (b.bbox.w*b.bbox.h) - (a.bbox.w*a.bbox.h));
-      const t = active[0];
-      const name = prompt('Enter name for this person (leave blank to use track ID):');
-      const label = (name && name.trim().length>0) ? name.trim() : t.id;
-      idToName[t.id] = label;
-      // persist map and gallery
-      try { localStorage.setItem('idToName', JSON.stringify(idToName)); tracker.saveGallery(); log('Enrolled', t.id, 'as', label); } catch(e){ console.warn('save failed', e); }
-    };
+      // tracker after camera start
+      tracker = new EmbeddingTracker(TRACKER_PARAMS);
+      tracker.loadGallery();
+      try { Object.assign(idToName, JSON.parse(localStorage.getItem('idToName') || '{}')); } catch (e) { }
 
-    document.getElementById('clearGalleryBtn').onclick = () => {
-      if(confirm('Clear saved gallery and labels (localStorage)?')){
-        localStorage.removeItem('face_gallery_v1');
-        localStorage.removeItem('idToName');
-        tracker = new EmbeddingTracker(TRACKER_PARAMS); // reset
-        for(const k in idToName) delete idToName[k];
-        log('Cleared saved gallery and labels');
-      }
-    };
+      // enroll / clear handlers
+      document.getElementById('enrollBtn').onclick = () => {
+        const active = tracker.getActiveTracks();
+        if (active.length === 0) { alert('No active face to enroll'); return; }
+        active.sort((a, b) => (b.bbox.w * b.bbox.h) - (a.bbox.w * a.bbox.h));
+        const t = active[0];
+        const name = prompt('Enter name (leave blank to use track id):');
+        const label = (name && name.trim().length > 0) ? name.trim() : t.id;
+        idToName[t.id] = label;
+        try { localStorage.setItem('idToName', JSON.stringify(idToName)); tracker.saveGallery(); } catch (e) { console.warn('save failed', e); }
+      };
 
-    // Save gallery on unload
-    window.addEventListener('beforeunload', () => {
-      try { tracker.saveGallery(); localStorage.setItem('idToName', JSON.stringify(idToName)); } catch(e){ }
-    });
+      document.getElementById('clearGalleryBtn').onclick = () => {
+        if (confirm('Clear saved gallery and labels (localStorage)?')) {
+          localStorage.removeItem('face_gallery_v1'); localStorage.removeItem('idToName');
+          tracker = new EmbeddingTracker(TRACKER_PARAMS);
+          for (const k in idToName) delete idToName[k];
+        }
+      };
 
-    log('Setup complete. Use enroll to assign names.');
-  })();
+      window.addEventListener('beforeunload', () => {
+        try { tracker.saveGallery(); localStorage.setItem('idToName', JSON.stringify(idToName)); } catch (e) { }
+      });
+
+      status.textContent = 'Ready';
+    })();
   </script>
 </body>
+
 </html>
